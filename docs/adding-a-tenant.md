@@ -24,7 +24,7 @@ The file name must equal the `id`: `tenants/acme.json` declares `"id": "acme"`.
 
 ```jsonc
 {
-  "id": "acme",                    // tenant key everywhere: RLS, ledger, marts
+  "id": "acme",                    // tenant key: the tenant_id of every row, enforced by row-level security (RLS)
   "displayName": "Acme",
   "currency": "GBP",               // what marts report amounts in; never converted
   "fixturesDir": "fixtures/acme",  // where this tenant's files must live
@@ -69,7 +69,7 @@ Every source has a fixed set of columns (`src/config/sources.ts`). Each file mus
 | Source | Format | Columns |
 |--------|--------|---------|
 | `orders` | CSV | `order_id`, `created_at`, `channel`, `gross`, `currency`, `customer_email` |
-| `email_events` | NDJSON | `event_id`, `type`, `email`, `campaign_id`, `occurred_at` |
+| `email_events` | NDJSON (newline-delimited JSON: one object per line) | `event_id`, `type`, `email`, `campaign_id`, `occurred_at` |
 | `ad_spend` | CSV | `date`, `campaign_id`, `platform`, `spend` |
 | `refunds` | CSV | `refund_id`, `refunded_at`, `order_id`, `amount`, `currency` |
 

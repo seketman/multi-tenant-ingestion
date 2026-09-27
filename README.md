@@ -1,6 +1,12 @@
 # multi-tenant-ingestion
 
-Loads batch exports from several clients (tenants) into one Postgres database, keeps every tenant's rows invisible to every other tenant, and turns them into daily reporting views. Each batch file is loaded at most once, in one transaction, and recorded in a ledger with its sha256, so a crashed or repeated run is safe to rerun. Files that do not match the tenant's declared shape are quarantined with reasons instead of being half-loaded. A health check compares what the manifest says should have arrived with what the ledger says did. A report run publishes the daily numbers as versions, and when a late file changes a number a client was already told, it records a restatement instead of changing it silently.
+Loads batch exports from several clients (tenants) into one Postgres database and turns them into daily reporting views.
+
+- Every tenant's rows are invisible to every other tenant, enforced by the database, not by the application.
+- Each batch file is loaded at most once, in one transaction, and recorded in a ledger with its sha256, so a crashed or repeated run is safe to rerun.
+- Files that do not match the tenant's declared shape are quarantined with reasons instead of being half-loaded.
+- A health check compares what the manifest says should have arrived with what the ledger says did.
+- A report run publishes the daily numbers as versions. When a late file changes a number a client was already told, it records a restatement instead of changing it silently.
 
 ```text
 fixtures/<tenant>/<source>/batch_NN.*        what the client sent
@@ -21,7 +27,37 @@ ops.*  control plane: tenants, value maps, batch file ledger, report runs,
        published versions and restatements. pnpm check reads the ledger.
 ```
 
-All four layers are tenant-scoped with `FORCE ROW LEVEL SECURITY`. Adding a tenant is configuration only: see [docs/adding-a-tenant.md](docs/adding-a-tenant.md). Design decisions and what is unfinished are in [TRADEOFFS.md](TRADEOFFS.md).
+All four layers are tenant-scoped with `FORCE ROW LEVEL SECURITY` (RLS). Adding a tenant is configuration only: see [docs/adding-a-tenant.md](docs/adding-a-tenant.md). Design decisions and what is unfinished are in [TRADEOFFS.md](TRADEOFFS.md).
+
+## Status
+
+| Area | State | Evidence |
+|------|-------|----------|
+| Idempotent loading, crash and replay | Finished | `src/ingest/loader.ts`, `test/loader.test.ts` |
+| Schema drift: declared aliases, whole-file quarantine otherwise | Finished | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts` |
+| Tenant isolation (forced RLS, non-superuser owner, app role owns nothing) | Finished | `migrations/001`-`005`, `test/isolation.test.ts`, `test/staging.test.ts` |
+| Third tenant by configuration only | Finished | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts` |
+| Staging and daily marts | Finished | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts` |
+| Missing-source detection | Finished | `src/ingest/check.ts`, `test/check.test.ts` |
+| Late arrivals: published versions and restatements | Finished | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts` |
+| Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
+| FX conversion, scheduler, alerting, streaming large files | Not built | see [TRADEOFFS.md](TRADEOFFS.md) |
+
+## Where to look
+
+| Path | What it holds |
+|------|---------------|
+| `tenants/*.json` | per-tenant config: currency, fixtures directory, column aliases, value maps |
+| `src/config/` | the canonical columns per source (`sources.ts`) and the config schema (`tenants.ts`) |
+| `src/ingest/loader.ts` | `pnpm load`: planning, sha256 ledger, replay classification, fault injection |
+| `src/ingest/headers.ts`, `parse.ts`, `reasons.ts` | header resolution and quarantine reasons |
+| `src/ingest/check.ts` | `pnpm check`: manifest vs ledger, exit codes |
+| `src/report/publish.ts` | `pnpm report`: versioned publication, restatements, `caused_by` |
+| `src/db/` | pools for the two roles, `withTenant`, migration runner, tenant seeding |
+| `migrations/` | roles, schemas, RLS policies, ledger, staging and marts views, published reports |
+| `docker/initdb/001_owner.sql` | creates the non-superuser owner role; the only thing the superuser does |
+| `fixtures/` | the supplied data and `manifest.json` |
+| `test/` | vitest suites against the real database |
 
 ## Requirements
 
@@ -139,9 +175,7 @@ pnpm report    # northwind: 18 restated; lumen: 7 restated
 pnpm report    # nothing to publish for either tenant
 ```
 
-- Northwind: 6 of the 18 are `daily_email_engagement` for exactly 2026-01-12 to 2026-01-17, all caused by `northwind/email_events/batch_05.ndjson`, which carries 24 late events for those days. The other 12 are `daily_revenue`.
-- Lumen: all 7 are `daily_revenue`. Refunds are dated after their batch window, so a day can first be published with only refunds, and is restated when its orders arrive.
-- A day batch 5 did not touch keeps its single version.
+Northwind's email engagement is restated for exactly 2026-01-12 to 2026-01-17, caused by `northwind/email_events/batch_05.ndjson`. A day batch 5 did not touch keeps its single version. The full breakdown, and why lumen's revenue days move, is in [TRADEOFFS.md](TRADEOFFS.md#late-arrivals).
 
 `test/report.test.ts` runs the same sequence on clones of the fixtures. It asserts that exactly the keys batch 5 changed are restated, with `before` and `after` equal to the live numbers, and that northwind's email restatements are exactly those six days, caused by email batch 5. The counts 18 and 7 come from that run.
 
@@ -176,32 +210,3 @@ COMMIT;
 
 Useful views: `marts.daily_revenue`, `marts.daily_ad_spend`, `marts.daily_email_engagement`, `marts.daily_channel_performance`, `staging.invalid_rows`. Published reports: `marts.reported_metric` (the latest published version of each key, meaning what the client was told), `ops.published_metric` (every version) and `ops.restatement`.
 
-## Status
-
-| Area | State | Evidence |
-|------|-------|----------|
-| Idempotent loading, crash and replay | Finished | `src/ingest/loader.ts`, `test/loader.test.ts` |
-| Schema drift: declared aliases, whole-file quarantine otherwise | Finished | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts` |
-| Tenant isolation (forced RLS, non-superuser owner, app role owns nothing) | Finished | `migrations/001`-`005`, `test/isolation.test.ts`, `test/staging.test.ts` |
-| Third tenant by configuration only | Finished | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts` |
-| Staging and daily marts | Finished | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts` |
-| Missing-source detection | Finished | `src/ingest/check.ts`, `test/check.test.ts` |
-| Late arrivals: published versions and restatements | Finished | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts` |
-| Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
-| FX conversion, scheduler, alerting, streaming large files | Not built | see [TRADEOFFS.md](TRADEOFFS.md) |
-
-## Where to look
-
-| Path | What it holds |
-|------|---------------|
-| `tenants/*.json` | per-tenant config: currency, fixtures directory, column aliases, value maps |
-| `src/config/` | the canonical columns per source (`sources.ts`) and the config schema (`tenants.ts`) |
-| `src/ingest/loader.ts` | `pnpm load`: planning, sha256 ledger, replay classification, fault injection |
-| `src/ingest/headers.ts`, `parse.ts`, `reasons.ts` | header resolution and quarantine reasons |
-| `src/ingest/check.ts` | `pnpm check`: manifest vs ledger, exit codes |
-| `src/report/publish.ts` | `pnpm report`: versioned publication, restatements, `caused_by` |
-| `src/db/` | pools for the two roles, `withTenant`, migration runner, tenant seeding |
-| `migrations/` | roles, schemas, RLS policies, ledger, staging and marts views, published reports |
-| `docker/initdb/001_owner.sql` | creates the non-superuser owner role; the only thing the superuser does |
-| `fixtures/` | the supplied data and `manifest.json` |
-| `test/` | vitest suites against the real database |
