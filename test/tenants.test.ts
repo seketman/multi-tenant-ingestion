@@ -89,6 +89,16 @@ describe("tenant config", () => {
     expect(issues(config)).toEqual([]);
   });
 
+  it("rejects a value map for the raw value __proto__, which parsing would otherwise drop silently", () => {
+    // Parsed from text: an object literal with a __proto__ key would set its prototype instead.
+    const sources: unknown = JSON.parse('{"orders":{"valueMaps":{"channel":{"__proto__":"paid","TikTok":"tiktok"}}}}');
+    expect(issues(withSources(sources))).toEqual(['raw value "__proto__" cannot be mapped']);
+  });
+
+  it("allows __proto__ as a column alias", () => {
+    expect(issues(withSources({ ad_spend: { columnAliases: { spend: ["__proto__"] } } }))).toEqual([]);
+  });
+
   it.each(["/etc/acme", "C:\\data\\acme", "../outside", "fixtures/../../outside", "fixtures\\..\\x"])(
     "rejects fixturesDir %s",
     (dir) => {

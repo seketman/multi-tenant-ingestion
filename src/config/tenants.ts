@@ -7,6 +7,19 @@ import { canonicalValues, SOURCE_COLUMNS, SOURCE_NAMES, type SourceName } from "
 const DEFAULT_TENANTS_DIR = fileURLToPath(new URL("../../tenants/", import.meta.url));
 
 /**
+ * One column's value map. zod's record parser drops a `__proto__` key without an issue
+ * (checked on zod 4.6), so a mapping for the raw value "__proto__" would vanish silently; it is
+ * rejected up front instead.
+ */
+const valueMapSchema = z
+  .unknown()
+  .refine(
+    (map) => typeof map !== "object" || map === null || !Object.hasOwn(map, "__proto__"),
+    'raw value "__proto__" cannot be mapped',
+  )
+  .pipe(z.record(z.string(), z.string()));
+
+/**
  * Per-source mapping from a tenant's raw export onto the canonical columns.
  * - columnAliases: canonical column -> other header names that mean the same thing.
  *   The canonical name itself is always accepted, so listing it is rejected as redundant.
@@ -23,7 +36,7 @@ const sourceMappingSchema = (source: SourceName) => {
   return z
     .object({
       columnAliases: z.partialRecord(column, z.array(z.string().min(1)).min(1)).default({}),
-      valueMaps: z.partialRecord(column, z.record(z.string(), z.string())).optional(),
+      valueMaps: z.partialRecord(column, valueMapSchema).optional(),
     })
     .strict()
     .superRefine(({ columnAliases, valueMaps }, ctx) => {

@@ -81,7 +81,9 @@ function parseNdjson(text: string, source: SourceName, aliases: ColumnAliases): 
 
   // Keys may differ from line to line (canonical on some, an alias on others); the union
   // is still one unambiguous raw -> canonical map because every alias has a single owner.
-  const columns: Record<string, string> = {};
+  // Null prototype, as in resolveHeaders: Object.assign sets keys with plain assignment, so
+  // a `__proto__` key would otherwise replace this object's prototype instead of being copied.
+  const columns = Object.create(null) as Record<string, string>;
   const records: RawRecord[] = [];
   text.split(/\r?\n/).forEach((line, index) => {
     const lineNo = index + 1;

@@ -15,6 +15,7 @@ export type HeaderResolution =
  * the same column (for example both `spend` and its alias `cost_usd`), or a missing column,
  * because any of those would make the canonical value of a row ambiguous or absent.
  * Header names are clipped in messages; the caller bounds how many reasons it keeps.
+ * The returned map has a null prototype, so every header, `__proto__` included, is an own key.
  */
 export function resolveHeaders(
   source: SourceName,
@@ -28,7 +29,9 @@ export function resolveHeaders(
   }
 
   const reasons: QuarantineReason[] = [];
-  const columns: Record<string, string> = {};
+  // No prototype: a header named `__proto__` must become an own key like any other, not
+  // reach Object.prototype's setter and vanish from the map.
+  const columns = Object.create(null) as Record<string, string>;
   const seen = new Set<string>();
   const resolvedFrom = new Map<string, string>();
   for (const header of headers) {

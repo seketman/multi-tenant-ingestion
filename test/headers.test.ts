@@ -62,6 +62,27 @@ describe("header resolution", () => {
     });
   });
 
+  it("rejects an undeclared header named __proto__ instead of dropping it", () => {
+    const result = resolveHeaders("ad_spend", ["date", "campaign_id", "platform", "spend", "__proto__"]);
+    expect(result).toEqual({
+      ok: false,
+      reasons: [{ code: "unknown_header", message: expect.stringContaining('"__proto__"') }],
+    });
+  });
+
+  it("maps a declared alias named __proto__ as an own key", () => {
+    const result = resolveHeaders("ad_spend", ["date", "campaign_id", "platform", "__proto__"], {
+      spend: ["__proto__"],
+    });
+    expect(result.ok).toBe(true);
+    const columns = result.ok ? result.columns : {};
+    expect(Object.hasOwn(columns, "__proto__")).toBe(true);
+    expect(columns["__proto__"]).toBe("spend");
+    expect(JSON.parse(JSON.stringify(columns))).toEqual(
+      JSON.parse('{"date":"date","campaign_id":"campaign_id","platform":"platform","__proto__":"spend"}'),
+    );
+  });
+
   it("rejects a repeated header", () => {
     expect(codes(resolveHeaders("ad_spend", ["date", "campaign_id", "platform", "spend", "date"]))).toEqual([
       "duplicate_header",

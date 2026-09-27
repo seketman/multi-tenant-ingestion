@@ -48,6 +48,24 @@ describe("CSV batch files", () => {
     });
   });
 
+  it("quarantines a file with an undeclared __proto__ header", () => {
+    const text = `${REFUNDS_HEADER},__proto__\nrf-1,2026-01-06T00:00:00Z,o-1,10.50,USD,x\n`;
+    expect(parseBatchFile(bytes(text), "refunds")).toEqual({
+      ok: false,
+      reasons: [{ code: "unknown_header", message: expect.stringContaining('"__proto__"') }],
+    });
+  });
+
+  it("loads a declared __proto__ alias under its canonical column", () => {
+    const text = "date,campaign_id,platform,__proto__\n2026-01-24,c-1,Meta,364.01\n";
+    const result = parseBatchFile(bytes(text), "ad_spend", { spend: ["__proto__"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(Object.hasOwn(result.columns, "__proto__") && result.columns["__proto__"]).toBe("spend");
+    const payload = result.records[0]?.payload ?? {};
+    expect(Object.hasOwn(payload, "__proto__") && payload["__proto__"]).toBe("364.01");
+  });
+
   it("quarantines a row whose field count differs from the header", () => {
     const text = `${REFUNDS_HEADER}\nrf-1,2026-01-06T00:00:00Z,o-1,10.50,USD\nrf-2,2026-01-07T00:00:00Z,o-2,3.00\n`;
     expect(parseBatchFile(bytes(text), "refunds")).toEqual({
@@ -130,6 +148,25 @@ describe("NDJSON batch files", () => {
       ok: false,
       reasons: [{ code: "unknown_header", message: expect.stringContaining('"utm_source"'), line: 2 }],
     });
+  });
+
+  it("quarantines an undeclared __proto__ key and maps a declared one without touching any prototype", () => {
+    // Written as text: an object literal with a __proto__ key would set its prototype instead.
+    const extra = event().replace("{", '{"__proto__":"x",');
+    expect(parseBatchFile(bytes(extra), "email_events")).toEqual({
+      ok: false,
+      reasons: [{ code: "unknown_header", message: expect.stringContaining('"__proto__"'), line: 1 }],
+    });
+
+    const aliased = event().replace('"type":', '"__proto__":');
+    const result = parseBatchFile(bytes(`${event()}\n${aliased}\n`), "email_events", { type: ["__proto__"] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(Object.keys(result.columns).sort()).toEqual(
+      ["__proto__", "campaign_id", "email", "event_id", "occurred_at", "type"].sort(),
+    );
+    expect(result.columns["__proto__"]).toBe("type");
+    expect(Object.getPrototypeOf(result.columns)).toBe(null);
   });
 
   it("quarantines invalid JSON, non-object lines and inner empty lines, each with its line", () => {
