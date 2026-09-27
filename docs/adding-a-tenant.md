@@ -86,7 +86,8 @@ Every source has a fixed set of columns (`src/config/sources.ts`). Each file mus
 
 - Seeding copies them into `ops.value_map`, which is tenant data under RLS. Staging looks values up there.
 - Matching is exact: `"Meta"` does not match `"meta"`.
-- A value without an entry passes through unchanged. Nothing flags it (see [TRADEOFFS.md](../TRADEOFFS.md)).
+- A value without an entry passes through unchanged. Nothing flags it (see [TRADEOFFS.md](../TRADEOFFS.md#known-gaps)).
+- Targets are not validated yet. A typo such as `"Opened": "opened"` is accepted, and those events are then silently not counted. Use exactly the canonical values below, and after the first load run `pnpm check` and `SELECT * FROM staging.invalid_rows` (see [Verify](#verify)).
 - Map onto the canonical values the marts use:
 
   | Column | Canonical values |
@@ -157,7 +158,9 @@ A listed file that is absent is reported as `missing` by `pnpm load` and `not_re
 
 ## Verify
 
-`pnpm check` should print `acme: healthy (N/N batches loaded, as of <latest covers_to>)` if every listed batch loaded. Exit code 2 means findings; the lines below the summary say which batch and why.
+`pnpm check` should print `acme: healthy (N/N batches loaded, as of <latest covers_to>)` if every listed batch loaded. Exit code 2 means findings; the lines below the summary say which batch and why. The exit code covers every tenant, so with the supplied fixtures it is 2 even when `acme` is healthy: lumen's `ad_spend` batch 3 never arrived. Read the line for your tenant.
+
+`staging.invalid_rows` in the query below is not reported by any command yet, so check it by hand after the first load: a non-empty result means values that failed their cast and are left out of the marts' sums (an order with a bad `gross` is still counted in `orders`).
 
 Then query the marts as the application role. Every tenant table and view returns zero rows until the transaction sets `app.tenant_id`:
 
@@ -191,7 +194,7 @@ const rows = await withTenant("acme", async (client) =>
 
 - Code in `src/`: the loader, parser, check and seeding read tenants from `tenants/*.json`.
 - Migrations: RLS policies, staging and marts are generic over `tenant_id` and join `ops.value_map` for mappings.
-- Tests for existing tenants: they run under their own throwaway ids.
+- Tests: they exercise the supplied tenants and synthetic ones under their own ids, so an added tenant does not change them.
 - Other tenants' config or files: a manifest entry cannot reach outside its tenant's `fixturesDir`.
 
 Removing a tenant file does not delete the tenant or its data from the database; seeding only inserts and updates.

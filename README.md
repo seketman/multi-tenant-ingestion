@@ -31,15 +31,17 @@ All four layers are tenant-scoped with `FORCE ROW LEVEL SECURITY` (RLS). Adding 
 
 ## Status
 
-| Area | State | Evidence |
-|------|-------|----------|
-| Idempotent loading, crash and replay | Finished | `src/ingest/loader.ts`, `test/loader.test.ts` |
-| Schema drift: declared aliases, whole-file quarantine otherwise | Finished | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts` |
-| Tenant isolation (forced RLS, non-superuser owner, app role owns nothing) | Finished | `migrations/001`-`005`, `test/isolation.test.ts`, `test/staging.test.ts` |
-| Third tenant by configuration only | Finished | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts` |
-| Staging and daily marts | Finished | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts` |
-| Missing-source detection | Finished | `src/ingest/check.ts`, `test/check.test.ts` |
-| Late arrivals: published versions and restatements | Finished | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts` |
+I went deep on two areas: loading that is safe to rerun, and tenant isolation enforced by the database. The rest is built and tested, with the gaps below. Each gap is explained in [TRADEOFFS.md](TRADEOFFS.md#known-gaps).
+
+| Area | State | Evidence, and the known gap |
+|------|-------|-----------------------------|
+| Idempotent loading, crash and replay | Done in depth | `src/ingest/loader.ts`, `test/loader.test.ts` |
+| Tenant isolation (forced RLS, non-superuser owner, app role owns nothing) | Done in depth | `migrations/001`-`005`, `test/isolation.test.ts`, `test/staging.test.ts`. Gap: any app session can choose any `app.tenant_id`; the application is trusted to pass the right one |
+| Schema drift: declared aliases, whole-file quarantine otherwise | Built, with known gaps | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts`. Gap: a declared alias is adapted silently; no command reports it |
+| Staging and daily marts | Built, with known gaps | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts`. Gap: unmapped values and failed casts are left out of the numbers without an alert |
+| Missing-source detection | Built, with known gaps | `src/ingest/check.ts`, `test/check.test.ts`. Gap: `pnpm check` finds the missing batch, but nothing stops `pnpm report` from publishing those days as real numbers |
+| Late arrivals: published versions and restatements | Built, with known gaps | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts`. Gap: a value-map edit restates history with an empty `caused_by` |
+| Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`. Gap: value-map targets are not validated, so a typo is silently not counted |
 | Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
 | FX conversion, scheduler, alerting, streaming large files | Not built | see [TRADEOFFS.md](TRADEOFFS.md) |
 
@@ -63,7 +65,7 @@ All four layers are tenant-scoped with `FORCE ROW LEVEL SECURITY` (RLS). Adding 
 
 | Tool | Version | Source |
 |------|---------|--------|
-| Docker with Compose | any recent | runs `postgres:17` from `docker-compose.yml` on `localhost:54329` |
+| Docker with Compose | any recent | runs `postgres:17` from `docker-compose.yml` on `localhost:54329`; that port must be free |
 | Node.js | `^22.18.0` or `>=24.2.0` | `package.json` `engines`; the CLIs use `import.meta.main`, added in Node 22.18.0 and 24.2.0 (not in 23) |
 | pnpm | `11.10.0` | `package.json` `packageManager`; `corepack enable` installs it, or use an installed pnpm |
 
@@ -80,7 +82,12 @@ pnpm check        # manifest vs ledger; exits 2 on the supplied fixtures (see be
 pnpm report       # publishes version 1 of every mart day; a rerun without new data publishes nothing
 pnpm test         # needs the database up and migrated; uses its own throwaway tenants
 pnpm typecheck
-pnpm db:reset     # drops the volume and starts an empty database (then pnpm migrate again)
+```
+
+To start again from an empty database (drops the volume, then recreates the schema):
+
+```sh
+pnpm db:reset && pnpm migrate
 ```
 
 Expected output of the first `pnpm load` on the supplied fixtures ends with:
@@ -91,7 +98,9 @@ load: 39 loaded, 0 skipped, 0 quarantined, 1 missing, 0 failed, 0 blocked
 
 `pnpm report` prints one line per tenant: `published: <tenant> (run <id>; <n> versions, <n> restated, <n> unchanged)`, or `nothing to publish` in place of the run when nothing changed. For example, after batch 5 arrives late (see [Late arrivals](#late-arrivals-publish-load-late-data-publish-again)): `published: northwind (run 4; 67 versions, 18 restated, 207 unchanged)`. Restatements are information, not errors: it exits 0 unless a tenant failed. Each tenant publishes in its own transaction.
 
-The one `missing` file is `lumen/ad_spend/batch_03.csv`: the manifest lists it, the fixtures do not contain it. That is a finding about the data, not a failure of the run, so `pnpm load` still exits 0.
+The one `missing` file is `lumen/ad_spend/batch_03.csv`: the manifest lists it, the fixtures do not contain it. That is a finding about the data, not a failure of the run, so `pnpm load` still exits 0. The same holds for quarantined files: `pnpm load` exits 0 when it quarantines, and 1 only when a file failed to load.
+
+Because of that missing batch, `pnpm check` exits 2 overall on the supplied fixtures even though northwind is healthy: the exit code covers every tenant. Nothing stops `pnpm report`, though: it publishes lumen's channel performance for January 18 to 23 with spend 0 and ROAS `NULL`, as if no money was spent (see [Known gaps](TRADEOFFS.md#known-gaps)).
 
 `pnpm seed` re-runs only the tenant seeding; `pnpm migrate` already does it. `pnpm db:down` stops the container and keeps the data.
 
@@ -136,7 +145,8 @@ Both tenants renamed `spend` to `cost_usd` from `ad_spend` batch 4. The tenant f
 
 ```sh
 pnpm db:reset && pnpm migrate
-# edit tenants/northwind.json: under sources.ad_spend set "columnAliases": {}
+# remove the declared alias: sources.ad_spend.columnAliases becomes {}
+node -e 'const fs=require("fs"),p="tenants/northwind.json",c=JSON.parse(fs.readFileSync(p));c.sources.ad_spend.columnAliases={};fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n")'
 pnpm load
 # quarantined: northwind/ad_spend/batch 4 (unknown_header: header "cost_usd" is neither a column of ad_spend nor a declared alias; missing_column: column "spend" is missing)
 # quarantined: northwind/ad_spend/batch 5 (...same reasons...)
@@ -158,6 +168,8 @@ git checkout -- fixtures/northwind/orders/batch_05.csv
 
 The batch stays `loaded`, but the check no longer lets it look healthy: the numbers already reported may be superseded by data nobody has loaded.
 
+`conflicting_redelivery` stays after the fixture is restored, until `pnpm db:reset`. That is by design: the quarantined attempt is a row in the append-only ledger, which is an audit trail of what was delivered, not a mirror of the files on disk today.
+
 The same bytes under a different batch number are quarantined as `duplicate_content`, since loading them would count every row twice.
 
 ### Late arrivals: publish, load late data, publish again
@@ -175,11 +187,11 @@ pnpm report    # northwind: 18 restated; lumen: 7 restated
 pnpm report    # nothing to publish for either tenant
 ```
 
-Northwind's email engagement is restated for exactly 2026-01-12 to 2026-01-17, caused by `northwind/email_events/batch_05.ndjson`. A day batch 5 did not touch keeps its single version. The full breakdown, and why lumen's revenue days move, is in [TRADEOFFS.md](TRADEOFFS.md#late-arrivals).
+Northwind's email engagement is restated for exactly 2026-01-12 to 2026-01-17, caused by `northwind/email_events/batch_05.ndjson`. Revenue is restated too, and not only at the edge of the window: lumen's refunds batch 5 carries refunds dated January 9 and 28, weeks before its window, so those days' refunds and net go up after the client was told them. A day batch 5 did not touch keeps its single version. The day-by-day breakdown for both tenants is in [TRADEOFFS.md](TRADEOFFS.md#late-arrivals).
 
 `test/report.test.ts` runs the same sequence on clones of the fixtures. It asserts that exactly the keys batch 5 changed are restated, with `before` and `after` equal to the live numbers, and that northwind's email restatements are exactly those six days, caused by email batch 5. The counts 18 and 7 come from that run.
 
-Each restatement says what the client was told (`before`), what the number is now (`after`) and which batch files caused it (`caused_by`, `ops.batch_file` ids):
+Each restatement says what the client was told (`before`), what the number is now (`after`) and which batch files caused it (`caused_by`, `ops.batch_file` ids). Run this in `psql` as the application role (`docker compose exec postgres psql -U pipeline_app -d pipeline`, see [Query the data](#query-the-data)):
 
 ```sql
 BEGIN;

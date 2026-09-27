@@ -1,6 +1,6 @@
 # Tradeoffs
 
-Short version: the loading path (replay, drift, isolation) is built deep and tested against a real database (106 tests in 9 files). Modelling, late arrivals and missing-source detection are built on top of it. Currency conversion, scheduling and large-file streaming are not built, on purpose.
+Short version: the loading path (replay, drift, isolation) is built deep and tested against a real database (over 100 tests). Modelling, late arrivals and missing-source detection are built on top of it and tested, with the known gaps listed [below](#known-gaps). Currency conversion, scheduling and large-file streaming are not built, on purpose.
 
 Built with AI assistance under my direction. Every change went through adversarial review lenses (risk, reliability, resilience) before commit. The history is committed as work units, each with its tests (`git log`).
 
@@ -62,8 +62,22 @@ The marts are live views over everything loaded, so a late file changes them sil
 Evidence from the fixtures (`test/report.test.ts`: batches 1-4, publish, batch 5, publish):
 
 - Northwind: 18 restatements. Six are `daily_email_engagement` for exactly 2026-01-12 to 2026-01-17, all caused by `email_events/batch_05.ndjson`, which carries 24 events for days batch 2 already covered. For example, 2026-01-13 opens went from 18 to 20, clicks from 10 to 11, unsubscribes from 15 to 16. The other 12 are `daily_revenue`.
-- Lumen: 7 restatements, all `daily_revenue`. Refunds are dated after their batch window in every refunds file, so a day can first be published with refunds only, and is restated when its orders arrive.
+- Lumen: 7 restatements, all `daily_revenue`.
 - Days batch 5 did not touch are never restated.
+
+The revenue restatements follow from how refunds are dated. `daily_revenue` puts a refund on the day it was refunded (cash basis), and a refunds batch is not limited to its window: lumen's `refunds/batch_05.csv` covers 2026-01-30 to 02-04 but carries refunds dated January 9, 10, 11 and 28. Earlier refund files also carry refunds dated after their window, for orders that only arrive in orders batch 5; until then those refunds have no order and count as orphans. I derived the breakdown from the fixture files with a read-only script (same de-duplication and orphan rule as the views), and it matches the test's counts:
+
+| Why the day changed | Lumen | Northwind |
+|---------------------|-------|-----------|
+| A late refund for an order already reported: `refunds` and `net` change | 2026-01-09 (+70.44, order `LU-29461135` from orders batch 1), 2026-01-28 (+101.62) | 2026-01-22 (+28.61) |
+| A late orphan refund (order `*-00000000`): the orphan count and amount change | 2026-01-10, 2026-01-11 | 2026-01-10, 2026-01-11 |
+| Batch 5 orders arrive for a day published with refunds only; on most of these days, refunds counted as orphans move into `refunds` | 2026-02-02, 2026-02-03 | 2026-01-30, 2026-01-31, 2026-02-02, 2026-02-03, 2026-02-04 |
+| A refund-only day after the last order date; its refund stops being an orphan once batch 5 brings the order | 2026-02-10 | 2026-02-05, 2026-02-07 (plus a batch 5 refund), 2026-02-09, 2026-02-11 |
+| Total | 7 | 12 |
+
+The first two rows are the case this feature exists for: a number the client was already told changed because a genuinely late record arrived. The last two rows show a modelling gap: before batch 5, "orphan" meant both "this order does not exist" and "this order has not arrived yet". The orphan counts published for those days were wrong at the time, not just incomplete.
+
+Why restate and keep an audit trail rather than the alternatives. Posting the change as an adjustment in the current period keeps old reports frozen, but the daily marts are per-day facts that a client reconciles against their own daily finance summary, so the day itself should be right. Closing periods and never touching a closed day is what finance teams do eventually, but it needs someone to decide when a period closes. So the day is corrected, and `ops.published_metric` and `ops.restatement` keep what the client was told and why it changed. A period close would be the next step, as a closed flag on `ops.report_run` or `ops.published_metric` that turns a restatement of a closed day into an adjustment instead.
 
 ### Tenant isolation
 
@@ -83,8 +97,21 @@ Evidence from the fixtures (`test/report.test.ts`: batches 1-4, publish, batch 5
 | Scheduler and alerting | `pnpm check` exposes exit codes and a stable text format; wiring that to a scheduler is environment-specific. |
 | Streaming large files | Files are read whole into memory. The fixtures are small, and per-file atomicity was the priority. Inserts are already chunked (`INSERT_CHUNK_SIZE`). |
 | Accepting a `batch_conflict` as a restatement of a whole batch | It needs an operator decision. Today the new bytes are held in quarantine with the reason. |
-| Flags for unmapped values | A value with no map entry passes through unchanged. An unknown email event type is then not counted by any engagement column, and nothing flags it. |
 | Materialized marts, indexes for volume | Views are correct and fast enough for fixture-sized data. |
+
+### Known gaps
+
+These are built far enough to work on the fixtures, but each has a hole I know about and did not close in the time I had.
+
+| Gap | What happens today | What would close it |
+|-----|--------------------|---------------------|
+| A batch that never arrived is published as real numbers | Lumen's `ad_spend` batch 3 is missing, so its channel performance for January 18 to 23 shows spend 0 and ROAS `NULL`. `pnpm check` exits 2, but nothing stops `pnpm report`. | Store `covers_from` and `covers_to` in the ledger, and have `pnpm report` withhold or flag days that overlap a `not_received` or quarantined window. |
+| Value maps are not validated | A typo in a target (`"Opened": "opened"`) or a missing entry passes the value through, and it is simply not counted. `staging.invalid_rows` exists but no command reports it. | Validate value-map targets against the canonical values in the config schema, and have `pnpm check` report unmapped values and invalid-row counts. |
+| A failed cast still counts | An order whose `gross` fails its cast is counted in `orders` with gross `NULL`, and is listed in `staging.invalid_rows`. Nothing alerts. | The same `pnpm check` report of invalid rows. |
+| Declared drift is adapted silently | The `cost_usd` alias is applied at load time and the ledger stores the column map, but neither `pnpm load` nor `pnpm check` says "adapted via alias". | Print and report files loaded through an alias. |
+| Isolation trusts the application to pick the tenant | The database blocks unscoped and cross-tenant queries, but any application session can set any `app.tenant_id`. | Per-tenant roles (one pool or `SET ROLE` per tenant), or a `SECURITY DEFINER` entry point that every query goes through. Both add moving parts, which is why I stopped at the database guard. |
+| A value-map change restates history without a cause | Editing a value map changes staging, so the next `pnpm report` restates past days with an empty `caused_by`: the change came from config, not from a file. | Record config versions per report run and cite them in `caused_by`. |
+| "Orphan" also means "not arrived yet" | A refund whose order is in a later batch counts as an orphan until that batch loads (see [Late arrivals](#late-arrivals)). | Report refunds for unknown orders as pending until the order's window has been checked as complete. |
 
 ## How the third client gets added
 
@@ -100,10 +127,10 @@ The test "a third tenant added by configuration only" in `test/staging.test.ts` 
 
 In rough priority order:
 
-1. Publish only days up to what `pnpm check` reports as fresh, so a day that so far has only refunds (dated ahead of their batch window) is not published before its orders arrive. All 7 of lumen's restatements are this case.
-2. An operator flow that accepts a `batch_conflict` as a restatement of a whole batch, which today stays in quarantine and is flagged as `conflicting_redelivery`.
-3. Flag unmapped values in staging (for example in `staging.invalid_rows`), so a new channel or event type is visible instead of silently uncounted.
-4. Store `covers_from` and `covers_to` in the ledger, so the check does not depend on the current manifest to know what a loaded batch covered.
+1. A completeness gate on publishing: store `covers_from` and `covers_to` in the ledger, and have `pnpm report` withhold or flag days that overlap a `not_received` or quarantined window. That stops lumen's missing ad spend from being published as zero, and the check would no longer depend on the current manifest to know what a loaded batch covered. (Publishing only "fresh" days, which I had planned first, would hold back the refund-only days at the end of the window, but not the late refunds for days weeks back. Those are exactly what restatements are for.)
+2. Validate value-map targets against the canonical values in the config schema, and have `pnpm check` report unmapped values and `staging.invalid_rows` counts, so a new channel, a typo or a failed cast is visible instead of silently uncounted.
+3. An operator flow that accepts a `batch_conflict` as a restatement of a whole batch, which today stays in quarantine and is flagged as `conflicting_redelivery`.
+4. Report files loaded through a declared alias, and cite config changes in `caused_by`.
 5. Stream large files instead of buffering them whole.
 6. Set `lock_timeout` and TCP keepalive on the pools, add `'error'` listeners on pooled clients, and handle `EPIPE` on stdout in the CLIs.
 7. `ALTER DEFAULT PRIVILEGES` so future views get their grants without a migration having to remember.
