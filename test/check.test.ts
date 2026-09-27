@@ -434,6 +434,140 @@ describe("source health check on synthetic tenants", () => {
     expect(status).toBe(2);
   });
 
+  const AD_SPEND_HEADER = "date,campaign_id,platform,spend\n";
+
+  it("notes an ad_spend row a later batch restated on the same date, campaign and platform", async () => {
+    const tenant = tenantFor("adfixed", ["ad_spend"]);
+    await put(tenant, "ad_spend/batch_01.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,facebook,1.O0\n`);
+    await put(tenant, "ad_spend/batch_02.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,facebook,1.00\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-11"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([{ kind: "superseded_invalid_rows", source: "ad_spend", column: "spend", rows: 1 }]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (2/2 batches loaded, as of 2026-01-17)`,
+      "  note: ad_spend.spend 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
+  it("reports an ad_spend row with an unreadable key column as current, with every bad column", async () => {
+    // Without a readable date the line has no natural key, so the later batch cannot supersede it,
+    // and its bad spend stays current along with it.
+    const tenant = tenantFor("adnokey", ["ad_spend"]);
+    await put(tenant, "ad_spend/batch_01.csv", `${AD_SPEND_HEADER}2026-13-45,c-1,facebook,1.O0\n`);
+    await put(tenant, "ad_spend/batch_02.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,facebook,1.00\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-11"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([
+      { kind: "invalid_rows", source: "ad_spend", column: "date", rows: 1, firstBatch: 1, firstLine: 2 },
+      { kind: "invalid_rows", source: "ad_spend", column: "spend", rows: 1, firstBatch: 1, firstLine: 2 },
+    ]);
+    expect(report.notes).toEqual([]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: 2 findings (2/2 batches loaded, as of 2026-01-17)`,
+      "  invalid_rows: ad_spend.date 1 row (first: batch 1 line 2)",
+      "  invalid_rows: ad_spend.spend 1 row (first: batch 1 line 2)",
+    ]);
+    expect(status).toBe(2);
+  });
+
+  it("supersedes an ad_spend row whose platform a later batch spells canonically, since de-dup runs on the mapped value", async () => {
+    // Lumen maps Meta to facebook; the file header says spend, so no alias note joins the report.
+    const tenant: TenantConfig = { ...tenantFor("admapped", []), sources: { ad_spend: lumenSources.ad_spend } };
+    await put(tenant, "ad_spend/batch_01.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,Meta,1.O0\n`);
+    await put(tenant, "ad_spend/batch_02.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,facebook,1.00\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-11"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([{ kind: "superseded_invalid_rows", source: "ad_spend", column: "spend", rows: 1 }]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (2/2 batches loaded, as of 2026-01-17)`,
+      "  note: ad_spend.spend 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
+  it("notes an email event a later batch restated with the same event_id", async () => {
+    const tenant = tenantFor("emailfixed", ["email_events"]);
+    const event = (occurredAt: string) =>
+      `${JSON.stringify({ event_id: "e-1", type: "open", email: "a@example.com", campaign_id: "c-1", occurred_at: occurredAt })}\n`;
+    await put(tenant, "email_events/batch_01.ndjson", event("yesterday"));
+    await put(tenant, "email_events/batch_02.ndjson", event("2026-01-06T00:00:00Z"));
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "email_events", 1, "email_events/batch_01.ndjson", "2026-01-11"),
+      entry(tenant, "email_events", 2, "email_events/batch_02.ndjson", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([
+      { kind: "superseded_invalid_rows", source: "email_events", column: "occurred_at", rows: 1 },
+    ]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (2/2 batches loaded, as of 2026-01-17)`,
+      "  note: email_events.occurred_at 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
+  const REFUNDS_HEADER = "refund_id,refunded_at,order_id,amount,currency\n";
+
+  it("notes a refund a later batch restated with the same refund_id", async () => {
+    const tenant = tenantFor("refundfixed", ["refunds"]);
+    await put(tenant, "refunds/batch_01.csv", `${REFUNDS_HEADER}rf-1,2026-01-06T00:00:00Z,o-1,1.O0,USD\n`);
+    await put(tenant, "refunds/batch_02.csv", `${REFUNDS_HEADER}rf-1,2026-01-06T00:00:00Z,o-1,1.00,USD\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "refunds", 1, "refunds/batch_01.csv", "2026-01-11"),
+      entry(tenant, "refunds", 2, "refunds/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([{ kind: "superseded_invalid_rows", source: "refunds", column: "amount", rows: 1 }]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (2/2 batches loaded, as of 2026-01-17)`,
+      "  note: refunds.amount 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
+  it("lists declared alias notes before superseded invalid row notes, whatever their sources", async () => {
+    // orders sorts before ad_spend, so ordering all notes by source would put orders.gross first.
+    const tenant = tenantFor("mixednotes", ["orders", "ad_spend"]);
+    await put(tenant, "orders/batch_01.csv", `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,12.5O,USD,a@example.com\n`);
+    await put(tenant, "orders/batch_02.csv", `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,12.50,USD,a@example.com\n`);
+    await put(tenant, "ad_spend/batch_01.csv", "date,campaign_id,platform,cost_usd\n2026-01-06,c-1,facebook,1.O0\n");
+    await put(tenant, "ad_spend/batch_02.csv", `${AD_SPEND_HEADER}2026-01-06,c-1,facebook,1.00\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "orders", 1, "orders/batch_01.csv", "2026-01-11"),
+      entry(tenant, "orders", 2, "orders/batch_02.csv", "2026-01-17"),
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-11"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([
+      { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend", batches: [1] },
+      { kind: "superseded_invalid_rows", source: "orders", column: "gross", rows: 1 },
+      { kind: "superseded_invalid_rows", source: "ad_spend", column: "spend", rows: 1 },
+    ]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (4/4 batches loaded, as of 2026-01-17)`,
+      '  note: ad_spend batch 1 read header "cost_usd" as spend (declared alias)',
+      "  note: orders.gross 1 invalid row superseded by a later batch",
+      "  note: ad_spend.spend 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
   it("reports email event types with no value map entry, which the marts never count", async () => {
     // Lumen's map covers CLICK, OPEN, DELIVERED and UNSUBSCRIBE; BOUNCE has no entry and stays raw.
     const tenant: TenantConfig = { ...tenantFor("unmapped", []), sources: { email_events: lumenSources.email_events } };
