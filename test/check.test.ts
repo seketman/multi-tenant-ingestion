@@ -251,6 +251,55 @@ describe("source health check on synthetic tenants", () => {
     expect(status).toBe(0);
   });
 
+  it("names a single aliased batch in the singular", async () => {
+    const tenant = tenantFor("alias1", ["ad_spend"]);
+    const row = (day: string) => `${day},c-1,facebook,1.00\n`;
+    await put(tenant, "ad_spend/batch_01.csv", `date,campaign_id,platform,spend\n${row("2026-01-06")}`);
+    await put(tenant, "ad_spend/batch_02.csv", `date,campaign_id,platform,cost_usd\n${row("2026-01-07")}`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-06"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-07"),
+    ]);
+    expect(report.notes).toEqual([
+      { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend", batches: [2] },
+    ]);
+    expect(formatReport([report])[1]).toBe(
+      '  note: ad_spend batch 2 read header "cost_usd" as spend (declared alias)',
+    );
+    expect(status).toBe(0);
+  });
+
+  it("lists two aliased headers of one source in the order they were first loaded", async () => {
+    // cost_usd is first loaded (batch 1) but sorts after channel and follows it in the header row,
+    // so neither alphabetical nor column order would put it first.
+    const tenant: TenantConfig = {
+      ...tenantFor("alias2", []),
+      sources: { ad_spend: { columnAliases: { spend: ["cost_usd"], platform: ["channel"] } } },
+    };
+    const row = (day: string) => `${day},c-1,facebook,1.00\n`;
+    await put(tenant, "ad_spend/batch_01.csv", `date,campaign_id,platform,cost_usd\n${row("2026-01-06")}`);
+    await put(tenant, "ad_spend/batch_02.csv", `date,campaign_id,channel,spend\n${row("2026-01-07")}`);
+    await put(tenant, "ad_spend/batch_03.csv", `date,campaign_id,channel,cost_usd\n${row("2026-01-08")}`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-06"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-07"),
+      entry(tenant, "ad_spend", 3, "ad_spend/batch_03.csv", "2026-01-08"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([
+      { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend", batches: [1, 3] },
+      { kind: "declared_alias", source: "ad_spend", header: "channel", column: "platform", batches: [2, 3] },
+    ]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (3/3 batches loaded, as of 2026-01-08)`,
+      '  note: ad_spend batches 1, 3 read header "cost_usd" as spend (declared alias)',
+      '  note: ad_spend batches 2-3 read header "channel" as platform (declared alias)',
+    ]);
+    expect(status).toBe(0);
+  });
+
   it("reports a latest batch that was never delivered as not received and the source as stale", async () => {
     const tenant = tenantFor("late", ["refunds"]);
     await put(tenant, "refunds/batch_01.csv", "refund_id,refunded_at,order_id,amount,currency\nrf-1,2026-01-06T00:00:00Z,o-1,1.00,USD\n");
@@ -298,6 +347,10 @@ describe("source health check on synthetic tenants", () => {
     expect(formatReport([report])[1]).toBe(
       "  conflicting_redelivery: ad_spend/batch 1 is loaded, but a later delivery with different content was quarantined (batch_conflict)",
     );
+    // The loaded batch still read cost_usd as spend: a note and a finding on the same batch.
+    expect(report.notes).toEqual([
+      { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend", batches: [1] },
+    ]);
     expect(status).toBe(2);
   });
 
