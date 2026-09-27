@@ -9,7 +9,7 @@ import { appDatabaseUrl, closePools, getOwnerPool, withTenant } from "../src/db/
 import { upsertTenant } from "../src/db/seed.ts";
 import { InjectedFailure, loadBatches } from "../src/ingest/loader.ts";
 import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
-import { MART_NAMES, MARTS, type PublishResult, publishReports } from "../src/report/publish.ts";
+import { MART_NAMES, type MartName, MARTS, type PublishResult, publishReports } from "../src/report/publish.ts";
 import { isSupplied } from "./supplied-tenants.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
@@ -95,6 +95,19 @@ const summaryOf = (results: PublishResult[], tenant: string) => {
   return result;
 };
 
+/**
+ * The live keys of `live` that depend on `source` and fall inside `entry`'s window: the keys
+ * a report must withhold while that manifest batch has not loaded.
+ */
+const keysInWindow = (live: Map<string, string>, source: string, entry: Manifest["batches"][number]): string[] =>
+  [...live.keys()]
+    .filter((key) => {
+      const [mart, day] = key.split("|") as [MartName, string];
+      const sources: readonly { source: string }[] = MARTS[mart].lineage;
+      return sources.some((l) => l.source === source) && day >= entry.covers_from && day <= entry.covers_to;
+    })
+    .sort();
+
 describe("publishing reports on the supplied fixtures, with batch 5 arriving late", () => {
   let tenants: TenantConfig[];
   let manifest: Manifest;
@@ -102,6 +115,11 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
   const before = new Map<string, Map<string, string>>();
   const after = new Map<string, Map<string, string>>();
   let second: PublishResult[];
+  /** Lumen's ad_spend batch 3: listed in the manifest, never delivered. */
+  let missing: Manifest["batches"][number];
+  /** Per tenant, the live keys inside the window of that missing batch, before and after batch 5. */
+  const withheldBefore = new Map<string, string[]>();
+  const withheldAfter = new Map<string, string[]>();
 
   beforeAll(async () => {
     tenants = (await loadTenants()).filter(isSupplied).map((t) => ({ ...t, id: `${t.id}_${suffix}` }));
@@ -109,14 +127,36 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
     manifest = { batches: real.batches.filter(isSupplied).map((b) => ({ ...b, tenant: `${b.tenant}_${suffix}` })) };
     for (const tenant of tenants) await register(tenant);
 
-    await loadBatches({ tenants, manifest: { batches: manifest.batches.filter((b) => b.batch <= 4) } });
-    first = await publishReports({ tenants });
+    const found = manifest.batches.find((b) => b.tenant === lumen && b.source === "ad_spend" && b.batch === 3);
+    if (found === undefined) throw new Error("expected lumen's ad_spend batch 3 in the manifest");
+    missing = found;
+    const withheldIn = (tenantId: string, live: Map<string, string>) =>
+      tenantId === lumen ? keysInWindow(live, "ad_spend", missing) : [];
+
+    // Each run expects what had been delivered by then: batches 1-4, then all five.
+    const firstManifest = { batches: manifest.batches.filter((b) => b.batch <= 4) };
+    await loadBatches({ tenants, manifest: firstManifest });
+    first = await publishReports({ tenants, manifest: firstManifest });
     for (const t of tenants) before.set(t.id, await liveMarts(t.id));
 
     await loadBatches({ tenants, manifest: { batches: manifest.batches.filter((b) => b.batch === 5) } });
     for (const t of tenants) after.set(t.id, await liveMarts(t.id));
-    second = await publishReports({ tenants });
+    second = await publishReports({ tenants, manifest });
+    for (const t of tenants) {
+      withheldBefore.set(t.id, withheldIn(t.id, before.get(t.id) ?? new Map()));
+      withheldAfter.set(t.id, withheldIn(t.id, after.get(t.id) ?? new Map()));
+    }
   }, 60_000);
+
+  const publishedKeys = async (tenantId: string): Promise<Set<string>> =>
+    new Set(
+      (
+        await query<{ key: string }>(
+          tenantId,
+          "SELECT DISTINCT mart || '|' || to_char(day, 'YYYY-MM-DD') || '|' || dims::text AS key FROM ops.published_metric",
+        )
+      ).map((r) => r.key),
+    );
 
   const batch5Files = async (tenantId: string) =>
     new Map(
@@ -130,14 +170,16 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
 
   it.each(["northwind", "lumen"])("publishes %s's first run as version 1 of every key, with no restatement", async (name) => {
     const tenantId = `${name}_${suffix}`;
-    const live = before.get(tenantId);
+    const live = before.get(tenantId) ?? new Map<string, string>();
+    const withheld = withheldBefore.get(tenantId) ?? [];
     expect(summaryOf(first, tenantId)).toEqual({
       tenant: tenantId,
       status: "published",
       runId: expect.any(String),
-      published: live?.size,
+      published: live.size - withheld.length,
       restated: 0,
       unchanged: 0,
+      withheld: withheld.length,
     });
     const [firstRun] = await query<{ versions: number; max_version: number }>(
       tenantId,
@@ -145,13 +187,14 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
        WHERE run_id = $1`,
       [summaryOf(first, tenantId).runId],
     );
-    expect(firstRun).toEqual({ versions: live?.size, max_version: 1 });
+    expect(firstRun).toEqual({ versions: live.size - withheld.length, max_version: 1 });
   });
 
   it.each(["northwind", "lumen"])("restates exactly the %s keys batch 5 changed, from and to the live numbers", async (name) => {
     const tenantId = `${name}_${suffix}`;
-    const was = before.get(tenantId) ?? new Map<string, string>();
-    const now = after.get(tenantId) ?? new Map<string, string>();
+    const held = new Set(withheldAfter.get(tenantId));
+    const was = new Map([...(before.get(tenantId) ?? [])].filter(([key]) => !held.has(key)));
+    const now = new Map([...(after.get(tenantId) ?? [])].filter(([key]) => !held.has(key)));
     const changed = [...was].filter(([key, metrics]) => now.get(key) !== metrics).map(([key]) => key);
     const added = [...now.keys()].filter((key) => !was.has(key));
     expect(changed.length).toBeGreaterThan(0);
@@ -163,6 +206,7 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
       published: changed.length + added.length,
       restated: changed.length,
       unchanged: now.size - changed.length - added.length,
+      withheld: held.size,
     });
 
     const files = new Set((await batch5Files(tenantId)).values());
@@ -193,6 +237,42 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
        WHERE mart = 'daily_email_engagement' AND day = '2026-01-06'`,
     );
     expect(untouched?.versions).toBe(1);
+  });
+
+  it("withholds lumen's ad spend and channel performance for the days of the missing ad_spend batch", async () => {
+    const withheld = withheldAfter.get(lumen) ?? [];
+    expect(withheld.length).toBeGreaterThan(0);
+    expect(new Set(withheld.map((key) => key.split("|")[0]))).toEqual(new Set(["daily_channel_performance"]));
+    const published = await publishedKeys(lumen);
+    expect(withheld.filter((key) => published.has(key))).toEqual([]);
+
+    // Revenue and email engagement do not depend on ad_spend: every day of the window is published.
+    const inWindow = [...published].filter((key) => {
+      const day = key.split("|")[1] ?? "";
+      return day >= missing.covers_from && day <= missing.covers_to;
+    });
+    for (const mart of ["daily_revenue", "daily_email_engagement"]) {
+      expect(inWindow.filter((key) => key.startsWith(`${mart}|`))).toHaveLength(6);
+    }
+    expect(inWindow.filter((key) => key.startsWith("daily_channel_performance|") || key.startsWith("daily_ad_spend|"))).toEqual([]);
+
+    // The run records the window for both marts built from ad_spend, with the keys it held back.
+    const [run] = await query<{ withheld: unknown }>(lumen, "SELECT withheld FROM ops.report_run WHERE id = $1", [
+      summaryOf(second, lumen).runId,
+    ]);
+    const { path, covers_from, covers_to } = missing;
+    const window = { source: "ad_spend", batch: 3, path, covers_from, covers_to, status: "not_received" };
+    const keys = withheld.map((key) => {
+      const [, day, dims] = key.split("|");
+      return { day, dims: JSON.parse(dims ?? "") as unknown };
+    });
+    // daily_ad_spend has no row at all for those days, so its window holds back no key.
+    expect(run?.withheld).toEqual([
+      { mart: "daily_ad_spend", ...window, keys: [] },
+      { mart: "daily_channel_performance", ...window, keys: expect.arrayContaining(keys) },
+    ]);
+    expect((run?.withheld as { keys: unknown[] }[])[1]?.keys).toHaveLength(keys.length);
+    expect(summaryOf(second, northwind).withheld).toBe(0);
   });
 
   it("shows the latest version in marts.reported_metric and keeps the earlier one in the history", async () => {
@@ -232,15 +312,18 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
         ),
       );
     const was = await counts();
-    const third = await publishReports({ tenants });
+    const third = await publishReports({ tenants, manifest });
     for (const id of [northwind, lumen]) {
+      const withheld = withheldAfter.get(id)?.length ?? 0;
+      // Withholding alone writes no run: nothing was published.
       expect(summaryOf(third, id)).toEqual({
         tenant: id,
         status: "published",
         runId: null,
         published: 0,
         restated: 0,
-        unchanged: after.get(id)?.size,
+        unchanged: (after.get(id)?.size ?? 0) - withheld,
+        withheld,
       });
     }
     expect(await counts()).toEqual(was);
@@ -311,6 +394,22 @@ describe("publishing reports on synthetic tenants", () => {
     }
     await loadBatches({ tenants: [tenant], manifest: { batches }, rootDir: root });
   };
+  /** A manifest expecting orders batches `batches` of `tenant`, batch n covering 2026-03-(2n-1)..2026-03-(2n). */
+  const expecting = (tenant: TenantConfig, batches: number[]): Manifest => ({
+    batches: batches.map((batch) => ({
+      tenant: tenant.id,
+      source: "orders",
+      batch,
+      path: `${tenant.id}/orders/batch_0${batch}.csv`,
+      covers_from: `2026-03-${String(2 * batch - 1).padStart(2, "0")}`,
+      covers_to: `2026-03-${String(2 * batch).padStart(2, "0")}`,
+    })),
+  });
+  const reportedDays = async (tenantId: string) =>
+    query<{ day: string; version: number }>(
+      tenantId,
+      "SELECT to_char(day, 'YYYY-MM-DD') AS day, version FROM marts.reported_metric ORDER BY day",
+    );
   const count = async (tenantId: string, table: string): Promise<number> =>
     (await query<{ n: number }>(tenantId, `SELECT count(*)::int AS n FROM ${table}`))[0]?.n ?? -1;
 
@@ -358,5 +457,88 @@ describe("publishing reports on synthetic tenants", () => {
     expect(
       await query(tenant.id, "SELECT mart, to_char(day, 'YYYY-MM-DD') AS day, version FROM marts.reported_metric"),
     ).toEqual([{ mart: "daily_revenue", day: "2026-03-02", version: 1 }]);
+  });
+
+  it("withholds the days of a batch that has not arrived, then publishes them as version 1 once it loads", async () => {
+    const tenant = tenantFor("gap");
+    await register(tenant);
+    const manifest = expecting(tenant, [1, 2, 3]);
+    // Batch 3 carries a late order for 2026-03-03, a day of the missing batch 2.
+    await loadOrders(tenant, {
+      1: "o-1,2026-03-01T10:00:00Z,google,10.00,USD,a@example.invalid\n",
+      3: "o-3,2026-03-05T10:00:00Z,google,30.00,USD,a@example.invalid\no-9,2026-03-03T10:00:00Z,google,5.00,USD,a@example.invalid\n",
+    });
+    const gap = await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest });
+    expect(summaryOf(gap, tenant.id)).toMatchObject({ published: 2, restated: 0, unchanged: 0, withheld: 1 });
+    expect(await reportedDays(tenant.id)).toEqual([
+      { day: "2026-03-01", version: 1 },
+      { day: "2026-03-05", version: 1 },
+    ]);
+    const [run] = await query<{ withheld: unknown }>(tenant.id, "SELECT withheld FROM ops.report_run WHERE id = $1", [
+      summaryOf(gap, tenant.id).runId,
+    ]);
+    expect(run?.withheld).toEqual([
+      {
+        mart: "daily_revenue",
+        source: "orders",
+        batch: 2,
+        path: `${tenant.id}/orders/batch_02.csv`,
+        covers_from: "2026-03-03",
+        covers_to: "2026-03-04",
+        status: "not_received",
+        keys: [{ day: "2026-03-03", dims: {} }],
+      },
+    ]);
+
+    // Still missing: nothing new to publish, so no run is written, and the withholding is reported again.
+    const again = await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest });
+    expect(summaryOf(again, tenant.id)).toMatchObject({ runId: null, published: 0, unchanged: 2, withheld: 1 });
+
+    await loadOrders(tenant, { 2: "o-2,2026-03-04T10:00:00Z,google,20.00,USD,a@example.invalid\n" });
+    const filled = await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest });
+    expect(summaryOf(filled, tenant.id)).toMatchObject({ published: 2, restated: 0, unchanged: 2, withheld: 0 });
+    expect(await reportedDays(tenant.id)).toEqual(
+      ["2026-03-01", "2026-03-03", "2026-03-04", "2026-03-05"].map((day) => ({ day, version: 1 })),
+    );
+    expect(await count(tenant.id, "ops.restatement")).toBe(0);
+  });
+
+  it("withholds the days of a batch that was only quarantined", async () => {
+    const tenant = tenantFor("quarantined");
+    await register(tenant);
+    await loadOrders(tenant, {
+      1: "o-1,2026-03-01T10:00:00Z,google,10.00,USD,a@example.invalid\n",
+      // Too few columns: the whole file is quarantined.
+      2: "o-2,2026-03-03T10:00:00Z,google\n",
+      3: "o-3,2026-03-05T10:00:00Z,google,30.00,USD,a@example.invalid\no-9,2026-03-04T10:00:00Z,google,5.00,USD,a@example.invalid\n",
+    });
+    const result = await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest: expecting(tenant, [1, 2, 3]) });
+    expect(summaryOf(result, tenant.id)).toMatchObject({ published: 2, withheld: 1 });
+    expect((await reportedDays(tenant.id)).map((r) => r.day)).toEqual(["2026-03-01", "2026-03-05"]);
+    const [run] = await query<{ status: string }>(
+      tenant.id,
+      "SELECT withheld -> 0 ->> 'status' AS status FROM ops.report_run WHERE id = $1",
+      [summaryOf(result, tenant.id).runId],
+    );
+    expect(run?.status).toBe("quarantined");
+  });
+
+  it("keeps the last published version of a key whose window became incomplete, instead of tombstoning it", async () => {
+    const tenant = tenantFor("reopened");
+    await register(tenant);
+    // Batch 1 also carries an early order for 2026-03-03, published while batch 2 was not yet expected.
+    await loadOrders(tenant, {
+      1: "o-1,2026-03-01T10:00:00Z,google,10.00,USD,a@example.invalid\no-2,2026-03-03T10:00:00Z,google,20.00,USD,a@example.invalid\n",
+    });
+    await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest: expecting(tenant, [1]) });
+
+    // Batch 3 moves o-2 onto 2026-03-05; batch 2, now expected, has not arrived.
+    await loadOrders(tenant, { 3: "o-2,2026-03-05T10:00:00Z,google,20.00,USD,a@example.invalid\n" });
+    const result = await publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest: expecting(tenant, [1, 2, 3]) });
+    expect(summaryOf(result, tenant.id)).toMatchObject({ published: 1, restated: 0, unchanged: 1, withheld: 1 });
+    expect(await count(tenant.id, "ops.restatement")).toBe(0);
+    expect(await reportedDays(tenant.id)).toEqual(
+      ["2026-03-01", "2026-03-03", "2026-03-05"].map((day) => ({ day, version: 1 })),
+    );
   });
 });

@@ -1,9 +1,14 @@
+import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import type { SourceName } from "../config/sources.ts";
 import { loadTenants, type TenantConfig } from "../config/tenants.ts";
 import { closePools, getAppPool } from "../db/pool.ts";
 import { withTenant } from "../db/tenant-scope.ts";
+import { covers, type IncompleteWindow, incompleteWindows, type LedgerAttempt } from "../ingest/coverage.ts";
 import { describeError, InjectedFailure } from "../ingest/loader.ts";
+import { loadManifest, type Manifest, type ManifestEntry, manifestSchema } from "../ingest/manifest.ts";
+
+const DEFAULT_MANIFEST = fileURLToPath(new URL("../../fixtures/manifest.json", import.meta.url));
 
 /** Where a mart's rows come from: a staging view, its day column and its dimension columns. */
 interface LineageSpec {
@@ -67,6 +72,12 @@ export interface PublishOptions {
   marts?: MartName[];
   pool?: pg.Pool;
   /**
+   * The batches each tenant is expected to have delivered, a parsed manifest or the path of
+   * one; defaults to fixtures/manifest.json. A key inside the window of a listed batch that
+   * never loaded is withheld (see publishReports).
+   */
+  manifest?: Manifest | string;
+  /**
    * Fault injection for crash tests: once this many tenants have been published, the next
    * tenant throws `InjectedFailure` inside its transaction after its rows are inserted, before COMMIT.
    */
@@ -84,6 +95,8 @@ export type PublishResult =
       /** Versions that replaced a number already published (an ops.restatement row each). */
       restated: number;
       unchanged: number;
+      /** Keys held back because a batch covering their day, for a source they depend on, never loaded. */
+      withheld: number;
     }
   | { tenant: string; status: "failed"; error: string };
 
@@ -108,6 +121,19 @@ interface Snapshot {
   current: CurrentRow[];
   lineage: LineageRow[];
   files: { id: string; source: SourceName }[];
+  ledger: LedgerAttempt[];
+}
+
+/** One element of ops.report_run.withheld: an incomplete window of a mart and the keys it held back. */
+interface WithheldWindow {
+  mart: MartName;
+  source: SourceName;
+  batch: number;
+  path: string;
+  covers_from: string;
+  covers_to: string;
+  status: IncompleteWindow["status"];
+  keys: { day: string; dims: unknown }[];
 }
 
 const keyOf = (row: KeyedRow): string => `${row.mart}|${row.day}|${row.dims}`;
@@ -118,9 +144,10 @@ const jsonObject = (pairs: [string, string][]): string =>
   `jsonb_build_object(${pairs.map(([name, expr]) => `'${name}', ${expr}`).join(", ")})`;
 
 /**
- * One statement reading the marts, their lineage and the loaded files, so all three come
- * from the same snapshot even under READ COMMITTED: a file committed mid-run is either
- * in all of them or in none.
+ * One statement reading the marts, their lineage, the loaded files and the ledger, so all
+ * four come from the same snapshot even under READ COMMITTED: a file committed mid-run is
+ * either in all of them or in none, and a key is never judged complete by a ledger that
+ * is newer or older than its numbers.
  */
 function snapshotSql(marts: MartName[]): string {
   const current = marts.map((name) => {
@@ -142,7 +169,9 @@ function snapshotSql(marts: MartName[]): string {
     (SELECT coalesce(json_agg(c), '[]') FROM (${current.join(" UNION ALL ")}) c) AS current,
     (SELECT coalesce(json_agg(l), '[]') FROM (${lineage.join(" UNION ")}) l) AS lineage,
     (SELECT coalesce(json_agg(json_build_object('id', id::text, 'source', source)), '[]')
-     FROM ops.batch_file WHERE status = 'loaded') AS files`;
+     FROM ops.batch_file WHERE status = 'loaded') AS files,
+    (SELECT coalesce(json_agg(json_build_object('source', source, 'batch_no', batch_no, 'status', status)), '[]')
+     FROM ops.batch_file) AS ledger`;
 }
 
 /**
@@ -164,6 +193,17 @@ function snapshotSql(marts: MartName[]): string {
  * Metrics are compared as exact numeric strings, so a value stored with another scale
  * (10.0 vs 10.00) counts as a change.
  *
+ * Withheld: a key whose day falls inside the window (covers_from..covers_to) of a manifest
+ * batch with no loaded ledger row (not received, or only quarantined), for a source in the
+ * mart's lineage, is not compared at all: no new version, no restatement, no tombstone.
+ * Its numbers are missing a whole batch, and publishing them would tell the client, say,
+ * that no money was spent. If a version was published before the window became
+ * incomplete, it stays the latest, i.e. the last thing the client was told. Once the batch
+ * loads, the next run treats the key as usual: version 1 if it was never published, a
+ * restatement if it was and its numbers moved. The run records each incomplete window and
+ * the keys it held back in ops.report_run.withheld. A batch that loaded and was later
+ * redelivered with other bytes counts as loaded here; `pnpm check` reports it.
+ *
  * Each tenant publishes in one transaction under a per-tenant advisory lock, so a crash
  * leaves that tenant's publication either complete or absent. An unexpected error fails
  * that tenant and the others carry on; `InjectedFailure` propagates.
@@ -174,17 +214,21 @@ export async function publishReports({
   tenants,
   marts = MART_NAMES,
   pool = getAppPool(),
+  manifest,
   failAfterTenants,
 }: PublishOptions): Promise<PublishResult[]> {
   const unknown = marts.filter((m) => !Object.hasOwn(MARTS, m));
   if (unknown.length > 0) throw new Error(`Unknown marts: ${unknown.join(", ")}`);
+  const parsedManifest =
+    typeof manifest === "object" ? manifestSchema.parse(manifest) : await loadManifest(manifest ?? DEFAULT_MANIFEST);
 
   const results: PublishResult[] = [];
   let done = 0;
   for (const tenant of tenants) {
     const failBeforeCommit = failAfterTenants !== undefined && done >= failAfterTenants;
     try {
-      results.push(await publishTenant(tenant.id, marts, pool, failBeforeCommit));
+      const expected = parsedManifest.batches.filter((e) => e.tenant === tenant.id);
+      results.push(await publishTenant(tenant.id, marts, expected, pool, failBeforeCommit));
       done++;
     } catch (error) {
       if (error instanceof InjectedFailure) throw error;
@@ -206,6 +250,7 @@ interface NewRestatement extends NewVersion {
 async function publishTenant(
   tenantId: string,
   marts: MartName[],
+  expected: ManifestEntry[],
   pool: pg.Pool,
   failBeforeCommit: boolean,
 ): Promise<PublishResult> {
@@ -250,10 +295,45 @@ async function publishTenant(
           .sort(byNumber);
       };
 
+      // Per mart, the incomplete windows of the sources it is built from, each with the keys
+      // it holds back. A window with no key is kept too: the mart is incomplete there even
+      // when it has no row for those days.
+      const incomplete = incompleteWindows(expected, snapshot.ledger);
+      const windowsOf = new Map<MartName, { window: IncompleteWindow; record: WithheldWindow }[]>(
+        marts.map((mart) => {
+          const sources = new Set<string>(MARTS[mart].lineage.map((l: LineageSpec) => l.source));
+          const windows = incomplete
+            .filter((w) => sources.has(w.source))
+            .map((w) => ({
+              window: w,
+              record: {
+                mart,
+                source: w.source,
+                batch: w.batch,
+                path: w.path,
+                covers_from: w.coversFrom,
+                covers_to: w.coversTo,
+                status: w.status,
+                keys: [],
+              },
+            }));
+          return [mart, windows];
+        }),
+      );
+      const withheldKeys = new Set<string>();
+      /** True, and recorded, when `row`'s day is inside an incomplete window of its mart. */
+      const withhold = (key: string, row: KeyedRow): boolean => {
+        const hits = (windowsOf.get(row.mart) ?? []).filter(({ window }) => covers(window, row.day));
+        for (const { record } of hits) record.keys.push({ day: row.day, dims: JSON.parse(row.dims) as unknown });
+        if (hits.length > 0) withheldKeys.add(key);
+        return hits.length > 0;
+      };
+
       const versions: NewVersion[] = [];
       const restatements: NewRestatement[] = [];
       let unchanged = 0;
       for (const [key, row] of current) {
+        if (withhold(key, row)) continue;
         const previous = latest.get(key);
         if (previous === undefined) {
           versions.push({ ...row, version: 1 });
@@ -266,19 +346,24 @@ async function publishTenant(
         }
       }
       for (const [key, previous] of latest) {
-        if (current.has(key) || previous.metrics === null) continue;
+        if (current.has(key) || previous.metrics === null || withhold(key, previous)) continue;
         const tombstone = { mart: previous.mart, day: previous.day, dims: previous.dims, version: previous.version + 1, metrics: null };
         versions.push(tombstone);
         restatements.push({ ...tombstone, before: previous.metrics, causedBy: causedBy(key, previous) });
       }
 
+      const withheld = withheldKeys.size;
+      // A run row records a publication, so a run that publishes nothing writes nothing even
+      // when it withheld keys: the withholding follows from the manifest and the ledger and
+      // is recomputed, and reported, on every run until the batch loads.
       if (versions.length === 0) {
-        return { tenant: tenantId, status: "published", runId: null, published: 0, restated: 0, unchanged };
+        return { tenant: tenantId, status: "published", runId: null, published: 0, restated: 0, unchanged, withheld };
       }
 
       const { rows: runRows } = await client.query<{ id: string }>(
-        `INSERT INTO ops.report_run (tenant_id, loaded_batch_file_ids) VALUES ($1, $2::bigint[]) RETURNING id::text AS id`,
-        [tenantId, snapshot.files.map((f) => f.id)],
+        `INSERT INTO ops.report_run (tenant_id, loaded_batch_file_ids, withheld)
+         VALUES ($1, $2::bigint[], $3::jsonb) RETURNING id::text AS id`,
+        [tenantId, snapshot.files.map((f) => f.id), JSON.stringify([...windowsOf.values()].flat().map(({ record }) => record))],
       );
       const runId = runRows[0]?.id;
       if (runId === undefined) throw new Error("report run insert returned no id");
@@ -328,6 +413,7 @@ async function publishTenant(
         published: versions.length,
         restated: restatements.length,
         unchanged,
+        withheld,
       };
     },
     pool,
@@ -340,14 +426,15 @@ export function formatResult(result: PublishResult): string {
   const run = result.runId === null ? "nothing to publish" : `run ${result.runId}`;
   return (
     `published: ${result.tenant} (${run}; ${result.published} versions, ` +
-    `${result.restated} restated, ${result.unchanged} unchanged)`
+    `${result.restated} restated, ${result.unchanged} unchanged, ${result.withheld} withheld)`
   );
 }
 
-// CLI: `pnpm report`. Restatements are information, not errors: exit 0 unless a tenant failed.
+// CLI: `pnpm report`, optionally with MANIFEST=<path>. Restatements and withheld keys are
+// information, not errors: exit 0 unless a tenant failed.
 if (import.meta.main) {
   try {
-    const results = await publishReports({ tenants: await loadTenants() });
+    const results = await publishReports({ tenants: await loadTenants(), manifest: process.env.MANIFEST || DEFAULT_MANIFEST });
     for (const result of results) console.log(formatResult(result));
     if (results.some((r) => r.status === "failed")) process.exitCode = 1;
   } catch (error) {
