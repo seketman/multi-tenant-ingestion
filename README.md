@@ -43,7 +43,9 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 | Late arrivals: published versions and restatements | Built, with known gaps | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts`. Gap: a value-map edit restates history with an empty `caused_by` |
 | Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`, `test/tenants.test.ts`. The config rejects an event-type target that is not canonical. Gap: a missing value-map entry passes the config and is caught only by `pnpm check` after loading |
 | Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
-| FX conversion, scheduler, alerting, streaming large files | Not built | see [TRADEOFFS.md](TRADEOFFS.md) |
+| FX conversion | Not built: the data cannot settle it | no rate source or conversion date in the fixtures, and lumen's labels are wrong; see [TRADEOFFS.md](TRADEOFFS.md) |
+| Scheduler and alerting | Not built: environment-specific | `pnpm check` exit codes (0 healthy, 2 findings, 1 failed) are the interface a scheduler alerts on |
+| Streaming large files | Deferred on purpose | files are read whole to keep per-file all-or-nothing loading simple; inserts are already chunked; see [TRADEOFFS.md](TRADEOFFS.md) |
 
 ## Where to look
 
