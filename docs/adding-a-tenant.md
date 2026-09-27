@@ -2,21 +2,57 @@
 
 A new client is one JSON file, its batch files and its manifest entries. No TypeScript, SQL or model changes, and nothing anywhere branches on a tenant's name.
 
-## Quick path
+The examples use a tenant called `acme`. Replace it with your client's id.
 
-1. Write `tenants/<id>.json` (see [The config file](#the-config-file)).
-2. Put the batch files under the tenant's `fixturesDir`, for example `fixtures/acme/orders/batch_01.csv`.
-3. Add one entry per batch file to `fixtures/manifest.json`.
-4. Run:
+## Before you start
 
-   ```sh
-   pnpm migrate   # validates every tenants/*.json and seeds ops.tenant and ops.value_map
-   pnpm load      # loads the new tenant's batches; other tenants' files are skipped
-   pnpm check     # the new tenant should report "healthy", possibly with alias notes
-   pnpm report    # publishes version 1 of every complete day for the new tenant
-   ```
+**Prerequisites.** You have run `pnpm install`, `pnpm db:up` and `pnpm migrate` as in [Run it from a clean checkout](../README.md#run-it-from-a-clean-checkout), and port 54329 is free (see [Requirements](../README.md#requirements)).
 
-5. Verify with a scoped query ([Verify](#verify)).
+**What to collect from the client first.** Each item below becomes part of the config. Missing one shows up later as a quarantined file, a finding, or a silent wrong number.
+
+| Collect | Why |
+|---------|-----|
+| A sample header row (CSV) or the keys (NDJSON) of each source they send | every header must be a canonical column or a declared alias, or the whole file is quarantined ([Canonical columns](#canonical-columns)) |
+| The distinct values of `channel` (orders), `platform` (ad spend) and `type` (email events) | these go in `valueMaps`; an unmapped channel or platform passes through as its own channel. `pnpm tenant:validate` warns about it before loading; nothing flags it after |
+| The currency | `currency` in the config; amounts are never converted |
+| Which of the four sources they send | list only those in `sources`. A configured source with no manifest entries is a `no_manifest_entries` finding, so the tenant is never `healthy` |
+| The date window each file covers | `covers_from` and `covers_to` in the manifest; `pnpm report` withholds those days until the file loads |
+
+**Matching is exact.** Headers and values are compared byte for byte: no trimming, no case folding (`src/ingest/headers.ts`, `staging.map_value` in `migrations/006_staging.sql`). A header `Total Amount` needs exactly `"Total Amount"` as an alias; `total_amount` or `Total amount` will not match it. The same goes for `"FB"` and `"fb"` in a value map.
+
+## Checklist
+
+Do the steps in order. Each one says how you know it worked.
+
+1. **Write `tenants/acme.json`** (see [The config file](#the-config-file)).
+
+2. **Put the batch files under the tenant's `fixturesDir`**, for example `fixtures/acme/orders/batch_01.csv`.
+
+3. **Add one entry per batch file to `fixtures/manifest.json`** (see [Fixtures and manifest](#fixtures-and-manifest)).
+
+4. **Run `pnpm tenant:validate acme`.** It needs no database. It checks the config file, acme's manifest entries and every listed file: JSON syntax (with the file name), every schema problem, headers that would be quarantined, dates that do not exist, paths that are not on disk (with near-miss file names), files on disk that the manifest does not list, email event types that would not be counted, and the distinct `channel` and `platform` values after your value maps.
+   - Worked: `acme: 0 errors, ...` and exit code 0. Warnings are allowed; read them. Exit code 2 means errors; fix them and run it again. It is the fast loop: edit, validate, edit, with no reset needed.
+   - The `info values:` lines show the canonical `channel` and `platform` names acme will have. A raw spelling that has no map entry, or a channel in orders with no matching ad platform, is a warning.
+
+5. **Run `pnpm migrate`.** It validates every `tenants/*.json` and seeds `ops.tenant` and `ops.value_map`.
+   - Worked: the last line is `tenants: upserted ...` and the list includes `acme`. It reads `tenants: up to date` if nothing changed since the last run.
+   - Migrate comes before load because `ops.batch_file` references `ops.tenant`: loading a tenant that was never seeded fails on its first file.
+
+6. **Run `pnpm load`.** It loads every manifest file that is not already loaded. On a fresh database that means every tenant's files; on a database that already has the other tenants, their files show as `skipped:`.
+   - Worked: one `loaded: acme/<source>/batch <n> (<rows> rows)` line per file, and no `quarantined:` or `missing:` line for `acme`. The last line counts every tenant, so lumen's missing file is in it.
+
+7. **Run `pnpm check`.**
+   - Worked: `acme: healthy (N/N batches loaded, as of <latest covers_to>)`, possibly followed by `note:` lines for headers read through an alias.
+   - The exit code is still 2 with the supplied fixtures, because lumen's `ad_spend` batch 3 never arrived. Read the lines for `acme`, not the exit code. See [Verify](#verify) for what each finding means.
+
+8. **Confirm the distinct channel and platform values in the database** with the scoped query in [A channel or platform value is wrong](#a-channel-or-platform-value-is-wrong).
+   - Worked: only the canonical names you expect (the fixtures use `facebook`, `google`, `email`, `direct`), and no raw spelling such as `FB`.
+
+9. **Run `pnpm report`.** It publishes version 1 of every complete day for the new tenant.
+
+> **Do not run `pnpm report` until step 7 is clean for `acme` and steps 4 and 8 show the right values.** A report publishes numbers a client is told. Fixing a mapping after that restates history, and a remapped `channel` or `platform` shows up as a tombstone for the old key plus an unlinked new key (see [TRADEOFFS.md Known gaps](../TRADEOFFS.md#known-gaps)).
+
+If a step does not show what it should, go to [Troubleshooting and undo](#troubleshooting-and-undo).
 
 ## The config file
 
@@ -48,7 +84,7 @@ The file name must equal the `id`: `tenants/acme.json` declares `"id": "acme"`.
 }
 ```
 
-The real file is plain JSON, without the comments. This is the same tenant the test "a third tenant added by configuration only" in `test/staging.test.ts` builds.
+The real file is plain JSON, without the comments. The test "a third tenant added by configuration only" in `test/staging.test.ts` uses the same aliases and value maps, under the id `t_acme_<suffix>` and `fixturesDir` `fixtures/t_acme_<suffix>`.
 
 | Field | Rule | Used for |
 |-------|------|----------|
@@ -96,11 +132,13 @@ Every source has a fixed set of columns (`src/config/sources.ts`). Each file mus
   | `orders.channel`, `ad_spend.platform` | the same names on both sides, so channel revenue joins platform spend (the fixtures use `facebook`, `google`, `email`, `direct`) |
   | `email_events.type` | `delivered`, `open`, `click`, `unsubscribe`; other values are not counted in `marts.daily_email_engagement` |
 
-- Value maps are seeded, so a change needs `pnpm migrate` (or `pnpm seed`). The views follow the new map right away; nothing is reloaded.
+- Value maps are seeded, so a change needs `pnpm migrate` (or `pnpm seed`). Seeding makes `ops.value_map` equal to the config: it adds and updates entries, and deletes the ones you removed. The views follow the new map right away; nothing is reloaded.
 
 ## What validation errors look like
 
-`pnpm migrate`, `pnpm load` and `pnpm check` all validate every tenant file first and stop on the first invalid one:
+`pnpm migrate`, `pnpm load` and `pnpm check` all validate every tenant file first, in file-name order, and stop on the first invalid one. Only that file's errors are printed, so fix it and run again to see the next.
+
+A file that fails the schema lists every problem in it:
 
 ```text
 Invalid tenant config acme.json:
@@ -119,6 +157,14 @@ Invalid tenant config acme.json:
 ```text
 Tenant config other.json declares id "acme"; the file name must match the id
 ```
+
+A file that is not valid JSON (here, a trailing comma) fails before the schema runs, and the message does **not** name the file:
+
+```text
+Expected double-quoted property name in JSON at position 43 (line 4 column 1)
+```
+
+The same happens for a JSON syntax error in `fixtures/manifest.json`. `pnpm tenant:validate` names the file, and lists every invalid tenant file in one run. See [A JSON syntax error with no file name](#a-json-syntax-error-with-no-file-name).
 
 ## Fixtures and manifest
 
@@ -151,11 +197,11 @@ Add one entry per file to `fixtures/manifest.json`, under `batches`:
 
 | Field | Rule |
 |-------|------|
-| `tenant` | a tenant `id`; entries for unknown tenants are ignored |
+| `tenant` | a tenant `id`. `pnpm load` and `pnpm report` ignore entries for unknown tenants without a warning; `pnpm tenant:validate` reports them as `unknown_tenant`, with the closest id |
 | `source` | one of the four sources |
 | `batch` | positive integer, unique per tenant and source; batches load in this order, and a later batch wins on overlapping rows |
 | `path` | relative to `fixtures/`, and inside the tenant's `fixturesDir`, or the whole load is rejected before anything is written |
-| `covers_from`, `covers_to` | `YYYY-MM-DD`; `pnpm check` uses `covers_to` for freshness, and `pnpm report` withholds days in this window while the batch has not loaded |
+| `covers_from`, `covers_to` | the `YYYY-MM-DD` format. Load, check and report check only the format, so an impossible date such as `2026-02-30` passes them; `pnpm tenant:validate` rejects it. `covers_from` after `covers_to` rejects the manifest. `pnpm check` uses `covers_to` for freshness, and `pnpm report` withholds days in this window while the batch has not loaded |
 
 A listed file that is absent is reported as `missing` by `pnpm load` and `not_received` by `pnpm check`. That is how you declare a batch you expect but have not received. Until it loads, `pnpm report` withholds the days it covers in every mart built from that source. A tenant with no manifest entries gets no withholding.
 
@@ -197,6 +243,75 @@ const rows = await withTenant("acme", async (client) =>
 
 `withTenant` opens a transaction, sets `app.tenant_id` with `is_local = true`, runs the callback and commits. The setting ends with the transaction, so it never reaches the next user of a pooled connection.
 
+## Troubleshooting and undo
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `quarantined: acme/... (unknown_header: ...)` or `missing_column` from `pnpm load` | a header is not a canonical column or a declared alias | fix `columnAliases` and run `pnpm load` again. Only a `loaded` ledger row makes a file skip, so the quarantined attempt does not block the retry, and once the file loads `pnpm check` stops reporting it. Nothing needs a reset |
+| `missing:` from `pnpm load`, `not_received:` from `pnpm check` | the client has not sent the file, or the manifest `path` has a typo | check that the file exists at `fixtures/<path>`, using the path printed on the line. If it exists, the `path` is wrong; if not, the file has not arrived |
+| `no_manifest_entries: <source>` for `acme`, and `pnpm load` never mentions `acme` | the manifest entries have a misspelled `tenant`. Load and report ignore entries for unknown tenants without a warning | `pnpm tenant:validate` names the entry and the closest id. Fix the `tenant` field, or remove the source from `sources` if the client does not send it |
+| A channel or platform you did not expect, and no finding | a typo in a value-map target, or a raw spelling you did not map | see [A channel or platform value is wrong](#a-channel-or-platform-value-is-wrong) |
+| `uncounted_values: email_events.type ...` | a raw event type has no value-map entry | add the entry, then `pnpm migrate` (or `pnpm seed`); the views follow right away |
+| Wrong numbers from a file that loaded with the wrong alias | an alias change never reinterprets a loaded file; running `pnpm load` again prints `skipped:` | see [Undo a load](#undo-a-load) |
+| An error with no file name, such as `Expected double-quoted property name in JSON ...` | a JSON syntax error in a tenant file or the manifest | run `pnpm tenant:validate`, which names the file; see [A JSON syntax error with no file name](#a-json-syntax-error-with-no-file-name) |
+
+### A channel or platform value is wrong
+
+`orders.channel` and `ad_spend.platform` are open, so a typo or a spelling you did not map becomes a channel of its own. Before loading, `pnpm tenant:validate` lists the values after your value maps and warns on unmapped spellings. After loading, list what staging sees, as the application role:
+
+```sql
+BEGIN;
+SELECT set_config('app.tenant_id', 'acme', true);
+SELECT DISTINCT channel FROM staging.orders ORDER BY 1;
+SELECT DISTINCT platform FROM staging.ad_spend ORDER BY 1;
+COMMIT;
+```
+
+Fix the value map in `tenants/acme.json` and run `pnpm migrate` (or `pnpm seed`). The views follow the new map right away; nothing is reloaded. If `pnpm report` already ran, this restates history (see the warning in the [Checklist](#checklist)).
+
+### Undo a load
+
+A loaded file keeps the header map it was loaded with, and loading it again prints `skipped:`. To load it again under a corrected alias, its rows must go. There are two ways, and both delete history. In production that is an operator decision, not a routine fix.
+
+- **Reset everything**, only on a development database, because it resets every tenant:
+
+  ```sh
+  pnpm db:reset && pnpm migrate && pnpm load
+  ```
+
+- **Delete only this tenant's rows**, as the owner role inside the tenant's scope. RLS applies to the owner too, so without `set_config` the deletes match nothing. This mirrors the `afterAll` cleanups in `test/*.test.ts`, and keeps `ops.tenant` and `ops.value_map`:
+
+  ```sh
+  docker compose exec postgres psql -U pipeline_owner -d pipeline
+  ```
+
+  ```sql
+  BEGIN;
+  SELECT set_config('app.tenant_id', 'acme', true);
+  -- Published history, only if pnpm report ran for this tenant:
+  DELETE FROM ops.restatement WHERE tenant_id = 'acme';
+  DELETE FROM ops.published_metric WHERE tenant_id = 'acme';
+  DELETE FROM ops.report_run WHERE tenant_id = 'acme';
+  -- Loaded data and the ledger:
+  DELETE FROM raw.record WHERE tenant_id = 'acme';
+  DELETE FROM ops.batch_file WHERE tenant_id = 'acme';
+  COMMIT;
+  ```
+
+  The order follows the foreign keys: each table is deleted before the one it references. Then fix the alias and run `pnpm load` again.
+
+### A JSON syntax error with no file name
+
+`pnpm migrate`, `load`, `check` and `report` use `JSON.parse`, which does not know which file it read, so the message has a position but no name. `pnpm tenant:validate` reads each file itself and names it, for example `error invalid_json: tenants/acme.json: Expected double-quoted property name ...`. Without it, check each file on its own:
+
+```sh
+for f in tenants/*.json fixtures/manifest.json; do
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$f" 2>/dev/null || echo "invalid JSON: $f"
+done
+```
+
+Any JSON linter works too. The position in the original message (`line 4 column 1`) then points into that file.
+
 ## What never needs to change
 
 - Code in `src/`: the loader, parser, check and seeding read tenants from `tenants/*.json`.
@@ -204,4 +319,6 @@ const rows = await withTenant("acme", async (client) =>
 - Tests: they exercise the supplied tenants and synthetic ones under their own ids, so an added tenant does not change them.
 - Other tenants' config or files: a manifest entry cannot reach outside its tenant's `fixturesDir`.
 
-Removing a tenant file does not delete the tenant or its data from the database; seeding only inserts and updates.
+## Removing a tenant
+
+Removing a tenant file does not delete the tenant or its data from the database. Seeding only touches tenants that have a file: for each one it inserts or updates the `ops.tenant` row, and makes its `ops.value_map` rows equal to the config, deleting entries that were removed from it. A tenant without a file is left as it is. To delete its data, use the scoped deletes in [Undo a load](#undo-a-load), followed by `ops.value_map` and `ops.tenant`.

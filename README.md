@@ -41,7 +41,7 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 | Staging and daily marts | Built, with known gaps | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `011_current_invalid_rows.sql`, `test/staging.test.ts`. `pnpm check` reports current invalid rows and uncounted event types, and notes rows a later batch corrected (`test/check.test.ts`); orders count only a readable `gross`. Gap: a day where every order has an unreadable `gross` is published as `orders` 0 and `gross` 0 instead of being withheld |
 | Missing-source detection and the completeness gate | Built, with known gaps | `src/ingest/check.ts`, `src/ingest/coverage.ts`, `migrations/010_report_run_withheld.sql`, `test/check.test.ts`, `test/report.test.ts`. `pnpm report` withholds the days of a batch that never loaded, and the manifest rejects a window whose `covers_from` is after `covers_to`. Gap: a number published before its window became incomplete stays visible until the batch loads, which happens in normal operation when records dated outside their batch's window, such as late refunds, are published before the batch covering that day is listed; `pnpm check` alerts on it (`published_incomplete`), and whether to retract it is a product decision. `pnpm check` reports a configured source with no manifest entries as `no_manifest_entries`, but `pnpm report` publishes its marts without withholding |
 | Late arrivals: published versions and restatements | Built, with known gaps | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts`. Gap: a value-map edit restates history without naming it as the cause: `caused_by` is empty when no file arrived, blames unrelated newer files when some did, and a remapped `channel` or `platform` shows up as a tombstone plus an unlinked new key (see [Known gaps](TRADEOFFS.md#known-gaps)) |
-| Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`, `test/tenants.test.ts`. The config rejects an event-type target that is not canonical. Gap: a missing value-map entry passes the config and is caught only by `pnpm check` after loading |
+| Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, `src/onboarding/validate.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`, `test/tenants.test.ts`, `test/validate.test.ts`. The config rejects an event-type target that is not canonical, and `pnpm tenant:validate` checks a new tenant's config, manifest entries and files without a database, before anything loads (see [docs/adding-a-tenant.md](docs/adding-a-tenant.md)). Gap: an unmapped or misspelled value in an open column (`channel`, `platform`) is a warning there, not an error, and nothing flags it after loading |
 | Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
 | FX conversion | Not built: the data cannot settle it | no rate source or conversion date in the fixtures, and lumen's labels are wrong; see [TRADEOFFS.md](TRADEOFFS.md) |
 | Scheduler and alerting | Not built: environment-specific | `pnpm check` exit codes (0 healthy, 2 findings, 1 failed) are the interface a scheduler alerts on |
@@ -56,6 +56,7 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 | `src/ingest/loader.ts` | `pnpm load`: planning, sha256 ledger, replay classification, fault injection |
 | `src/ingest/headers.ts`, `parse.ts`, `reasons.ts` | header resolution and quarantine reasons |
 | `src/ingest/check.ts` | `pnpm check`: manifest vs ledger, data-quality findings, declared-alias notes, exit codes |
+| `src/onboarding/validate.ts` | `pnpm tenant:validate`: onboarding checks of config, manifest and files, without a database |
 | `src/report/publish.ts`, `src/ingest/coverage.ts` | `pnpm report`: versioned publication, restatements, `caused_by`, withholding incomplete days |
 | `src/db/` | pools for the two roles, `withTenant`, migration runner, tenant seeding |
 | `migrations/` | roles, schemas, RLS policies, ledger, staging and marts views, published reports |
@@ -78,6 +79,7 @@ No `.env` is needed: `src/db/env.ts` defaults to the local compose credentials. 
 ```sh
 pnpm install
 pnpm db:up        # Postgres 17 on localhost:54329, waits until healthy
+pnpm tenant:validate  # checks tenants/*.json, the manifest and the batch files; no database needed
 pnpm migrate      # applies migrations/ and seeds ops.tenant + ops.value_map from tenants/*.json
 pnpm load         # loads every manifest batch for every tenant
 pnpm check        # manifest vs ledger; exits 2 on the supplied fixtures (see below)
