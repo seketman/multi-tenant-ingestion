@@ -746,4 +746,91 @@ describe("published keys inside an incomplete window", () => {
     );
     expect(status).toBe(2);
   });
+
+  it("reads the latest published version, so a key since tombstoned does not count", async () => {
+    const tenant = tenantFor("pubtomb");
+    await register(tenant);
+    await loadOrders(tenant, { 1: order("o-1", "2026-03-01") + order("o-2", "2026-03-03") });
+    await publish(tenant, [1]);
+
+    // Batch 3 restates o-2, the only order of 2026-03-03, onto 2026-03-05. Batch 3 rather than 2, so
+    // batch 2 stays unloaded: the run below, with batch 2 not yet expected, withholds nothing and
+    // tombstones 2026-03-03.
+    await loadOrders(tenant, { 3: order("o-2", "2026-03-05") });
+    await publish(tenant, [1, 3]);
+    const history = await withTenant(tenant.id, async (client) => ({
+      published: (
+        await client.query(
+          `SELECT to_char(day, 'YYYY-MM-DD') AS day, version, metrics IS NULL AS tombstone
+           FROM ops.published_metric WHERE mart = 'daily_revenue' AND day = '2026-03-03' ORDER BY version`,
+        )
+      ).rows,
+      reported: (
+        await client.query(
+          "SELECT to_char(day, 'YYYY-MM-DD') AS day FROM marts.reported_metric WHERE mart = 'daily_revenue' ORDER BY day",
+        )
+      ).rows,
+    }));
+    // The history still holds the non-null version 1 of 2026-03-03; its latest version is the tombstone.
+    expect(history.published).toEqual([
+      { day: "2026-03-03", version: 1, tombstone: false },
+      { day: "2026-03-03", version: 2, tombstone: true },
+    ]);
+    expect(history.reported).toEqual([{ day: "2026-03-01" }, { day: "2026-03-05" }]);
+
+    // Batch 2 is now expected and has not arrived, but the client was last told nothing for 2026-03-03.
+    const { report, status } = await check(tenant, [1, 2, 3]);
+    expect(report.findings).toEqual([notReceived(tenant)]);
+    expect(status).toBe(2);
+  });
+
+  it("only flags marts built from the source of the incomplete window", async () => {
+    const northwind = (await loadTenants()).find((t) => t.id === "northwind")?.sources;
+    const tenant: TenantConfig = {
+      ...tenantFor("publineage"),
+      sources: { orders: northwind?.orders, ad_spend: northwind?.ad_spend },
+    };
+    await register(tenant);
+    // One ad_spend batch covering every orders window, loaded in full: the only incomplete window is orders batch 2.
+    const adSpend = {
+      tenant: tenant.id,
+      source: "ad_spend" as const,
+      batch: 1,
+      path: `${tenant.id}/ad_spend/batch_01.csv`,
+      covers_from: "2026-03-01",
+      covers_to: "2026-03-06",
+    };
+    const withAdSpend = (batches: number[]): Manifest => ({ batches: [...expecting(tenant, batches).batches, adSpend] });
+    const adFile = join(root, "fixtures", adSpend.path);
+    await mkdir(dirname(adFile), { recursive: true });
+    await writeFile(adFile, "date,campaign_id,platform,spend\n2026-03-03,c-1,google,5.00\n2026-03-04,c-2,facebook,7.00\n");
+    await loadBatches({ tenants: [tenant], manifest: { batches: [adSpend] }, rootDir: root });
+    await loadOrders(tenant, { 1: order("o-1", "2026-03-01") + order("o-2", "2026-03-03") });
+    await publishReports({ tenants: [tenant], marts: ["daily_ad_spend", "daily_revenue"], manifest: withAdSpend([1]) });
+
+    const inWindow = await withTenant(
+      tenant.id,
+      async (client) =>
+        (
+          await client.query(
+            `SELECT mart, count(*)::integer AS keys FROM marts.reported_metric
+             WHERE day BETWEEN '2026-03-03' AND '2026-03-04' GROUP BY mart ORDER BY mart`,
+          )
+        ).rows,
+    );
+    expect(inWindow).toEqual([
+      { mart: "daily_ad_spend", keys: 2 },
+      { mart: "daily_revenue", keys: 1 },
+    ]);
+
+    await loadOrders(tenant, { 3: order("o-5", "2026-03-05") });
+    const reports = await checkSources({ tenants: [tenant], manifest: withAdSpend([1, 2, 3]) });
+    const report = reportOf(reports, tenant.id);
+    // daily_ad_spend has two keys inside the window, but it is not built from orders.
+    expect(report.findings).toEqual([
+      notReceived(tenant),
+      expect.objectContaining({ kind: "published_incomplete", mart: "daily_revenue", source: "orders", batch: 2, keys: 1 }),
+    ]);
+    expect(exitStatus(reports)).toBe(2);
+  });
 });
