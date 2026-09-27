@@ -113,11 +113,15 @@ In rough priority order:
 
 ## The hardest thing I hit
 
-<!-- TODO(author): pick and personalise -->
+Deciding what "I have already seen this file" means.
 
-**Candidate A: making isolation hold for the owner too.** RLS is easy to enable and easy to bypass by accident: a superuser, a `BYPASSRLS` role or a table owner without `FORCE` sees everything. I wanted the role that runs migrations to be bound by the same policies, so a bug in seeding could not write across tenants. That meant a non-superuser owner with `CREATEROLE` creating the app role. PostgreSQL 16 and later do not let such a role change `SUPERUSER`, `BYPASSRLS` and similar attributes on an existing role. So the attributes are fixed when the role is created, and a pre-existing `pipeline_app` is checked and rejected if it has elevated attributes instead of being trusted (`migrations/001_roles_and_schemas.sql`). The consequence is that seeding itself must run inside `withTenant`, which is the point.
+A sha256 per file makes replay look solved: same hash, skip. It is not, because the hash and the batch number can agree or disagree independently, and each combination means something different: a replay, a client changing a batch it already delivered, or a re-send that would count every row twice (the classification table under [Replay](#replay)). And there is a fourth case that is not a replay at all: an export whose rows overlap an earlier batch inside different bytes.
 
-**Candidate B: replay classification.** "Have I seen this file?" has three different answers depending on what matches: same bytes and batch number (a replay, skip), same batch number with other bytes (the client changed a delivered batch), same bytes with another batch number (a re-send that would double-count). Overlapping exports are a fourth case that is not a replay at all and belongs in staging. The work was keeping these apart, making every outcome a ledger row with a reason rather than a log line, and making the unique index guard only loaded bytes so a quarantined file can still be retried.
+That fourth case was the one that mattered most for the numbers. Northwind's orders batch 3 repeats 14 orders from batch 2 inside different bytes, so no file-level check can catch it; it has to be resolved where rows have keys. Daily gross matches `finance_summary.csv` only after that de-duplication, and the tests assert both directions.
+
+My first version got the re-send case wrong: it matched on the hash alone, so a batch that re-sent another batch's bytes was reported as `skipped` and left no trace in the ledger. A review pass caught it before it was committed. The fix was to require both the hash and the batch number for a skip, quarantine the other cases with a reason, and serialize attempts per tenant and source so two runs cannot race past the check.
+
+The principle I ended up with: every outcome is a row in the ledger with a reason, never only a log line, and the unique index guards only loaded bytes, so a quarantined file can still be retried after a config fix.
 
 ## Decisions the data could not settle
 
