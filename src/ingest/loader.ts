@@ -235,6 +235,50 @@ async function loadFile(plan: PlannedFile, pool: pg.Pool, failBeforeCommit: bool
   }
 }
 
+/** A file of this tenant's source that is already in the ledger as loaded. */
+interface LoadedFile {
+  sha256: string;
+  batch_no: number;
+  row_count: number;
+}
+
+/**
+ * Holds back a file that clashes with an already loaded one, by batch number or by content;
+ * otherwise parses it with the tenant's column aliases. An exact repeat (same bytes, same
+ * batch) never reaches here: the caller skips it first.
+ */
+function classifyAndParse(
+  tenant: TenantConfig,
+  entry: ManifestEntry,
+  bytes: Buffer,
+  sha256: string,
+  previous: LoadedFile[],
+): ParseResult {
+  const sameBatch = previous.find((row) => row.batch_no === entry.batch);
+  // Restating a loaded batch needs its own handling; until then it is held back.
+  if (sameBatch !== undefined) {
+    return quarantine({
+      code: "batch_conflict",
+      message: `batch ${entry.batch} was already loaded with different content (sha256 ${sameBatch.sha256})`,
+    });
+  }
+
+  const sameBytes = previous.find((row) => row.sha256 === sha256);
+  // Loading it would count every row twice under two batch numbers.
+  if (sameBytes !== undefined) {
+    return quarantine({
+      code: "duplicate_content",
+      message: `file has the same content as batch ${sameBytes.batch_no}, which is already loaded`,
+    });
+  }
+
+  const mapping = tenant.sources[entry.source];
+  if (mapping === undefined) {
+    return quarantine({ code: "source_not_configured", message: `${tenant.id} has no ${entry.source} source` });
+  }
+  return parseBatchFile(bytes, entry.source, mapping.columnAliases);
+}
+
 async function loadBytes(
   { entry, tenant }: PlannedFile,
   pool: pg.Pool,
@@ -249,7 +293,7 @@ async function loadBytes(
       // Serializes every attempt at this tenant's source, whatever the batch number, so
       // the ledger check and the insert below cannot interleave with another run's.
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${tenant.id}/${entry.source}`]);
-      const { rows: previous } = await client.query<{ sha256: string; batch_no: number; row_count: number }>(
+      const { rows: previous } = await client.query<LoadedFile>(
         `SELECT sha256, batch_no, row_count FROM ops.batch_file
          WHERE status = 'loaded' AND source = $1 AND (sha256 = $2 OR batch_no = $3)`,
         [entry.source, sha256, entry.batch],
@@ -257,25 +301,7 @@ async function loadBytes(
       const alreadyLoaded = previous.find((row) => row.sha256 === sha256 && row.batch_no === entry.batch);
       if (alreadyLoaded !== undefined) return { ...base, status: "skipped", rowCount: alreadyLoaded.row_count };
 
-      const mapping = tenant.sources[entry.source];
-      const sameBatch = previous.find((row) => row.batch_no === entry.batch);
-      const sameBytes = previous.find((row) => row.sha256 === sha256);
-      const parsed: ParseResult =
-        sameBatch !== undefined
-          ? // Restating a loaded batch needs its own handling; until then it is held back.
-            quarantine({
-              code: "batch_conflict",
-              message: `batch ${entry.batch} was already loaded with different content (sha256 ${sameBatch.sha256})`,
-            })
-          : sameBytes !== undefined
-            ? // Loading it would count every row twice under two batch numbers.
-              quarantine({
-                code: "duplicate_content",
-                message: `file has the same content as batch ${sameBytes.batch_no}, which is already loaded`,
-              })
-            : mapping === undefined
-              ? quarantine({ code: "source_not_configured", message: `${tenant.id} has no ${entry.source} source` })
-              : parseBatchFile(bytes, entry.source, mapping.columnAliases);
+      const parsed = classifyAndParse(tenant, entry, bytes, sha256, previous);
 
       if (!parsed.ok) {
         const { reasons } = parsed;
@@ -326,17 +352,25 @@ function failAfterFilesFromEnv(value: string | undefined): number | undefined {
  * file read through a declared alias also names each adapted header, so the drift is visible.
  */
 function formatResult(result: FileResult): string {
-  const outcome =
-    result.status === "failed"
-      ? result.error
-      : result.status === "quarantined"
-        ? result.reasons?.map((r) => `${r.code}: ${r.message}`).join("; ")
-        : result.status === "blocked"
-          ? "not attempted after an earlier failure of this tenant"
-          : result.status === "missing"
-            ? result.path
-            : [`${result.rowCount} rows`, ...(result.adapted ?? []).map((a) => `header ${a.header} read as ${a.column}`)].join("; ");
+  const outcome = describeOutcome(result);
   return `${result.status}: ${entryName(result)}${outcome === undefined ? "" : ` (${outcome})`}`;
+}
+
+function describeOutcome(result: FileResult): string | undefined {
+  switch (result.status) {
+    case "failed":
+      return result.error;
+    case "quarantined":
+      return result.reasons?.map((r) => `${r.code}: ${r.message}`).join("; ");
+    case "blocked":
+      return "not attempted after an earlier failure of this tenant";
+    case "missing":
+      return result.path;
+    default: {
+      const adaptations = (result.adapted ?? []).map((a) => `header ${a.header} read as ${a.column}`);
+      return [`${result.rowCount} rows`, ...adaptations].join("; ");
+    }
+  }
 }
 
 if (import.meta.main) {
