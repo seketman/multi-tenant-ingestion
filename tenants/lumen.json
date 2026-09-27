@@ -1,0 +1,46 @@
+{
+  "id": "lumen",
+  "displayName": "Lumen",
+  "currency": "EUR",
+  "fixturesDir": "fixtures/lumen",
+  "sources": {
+    "orders": {
+      "columnAliases": {},
+      "valueMaps": {
+        "channel": {
+          "Meta": "facebook",
+          "Google": "google",
+          "Newsletter": "email",
+          "Direct": "direct"
+        }
+      }
+    },
+    "email_events": {
+      "columnAliases": {},
+      "valueMaps": {
+        "type": {
+          "CLICK": "click",
+          "OPEN": "open",
+          "DELIVERED": "delivered",
+          "UNSUBSCRIBE": "unsubscribe"
+        }
+      }
+    },
+    "ad_spend": {
+      "columnAliases": {
+        "spend": ["cost_usd"]
+      },
+      "valueMaps": {
+        "platform": {
+          "Meta": "facebook",
+          "Google": "google",
+          "Newsletter": "email",
+          "Direct": "direct"
+        }
+      }
+    },
+    "refunds": {
+      "columnAliases": {}
+    }
+  }
+}

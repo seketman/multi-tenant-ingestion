@@ -1,0 +1,22 @@
+{
+  "id": "northwind",
+  "displayName": "Northwind",
+  "currency": "USD",
+  "fixturesDir": "fixtures/northwind",
+  "sources": {
+    "orders": {
+      "columnAliases": {}
+    },
+    "email_events": {
+      "columnAliases": {}
+    },
+    "ad_spend": {
+      "columnAliases": {
+        "spend": ["cost_usd"]
+      }
+    },
+    "refunds": {
+      "columnAliases": {}
+    }
+  }
+}
