@@ -57,12 +57,15 @@ interface Workspace {
   /** Path under fixtures/ -> content. */
   files?: Record<string, string>;
   manifest?: unknown;
+  /** Tenant ids to validate; default: every tenant file. */
+  ids?: string[];
 }
 
 async function validate({
   tenants = { "acme.json": acmeConfig() },
   files = acmeFiles(),
   manifest = acmeManifest(),
+  ids,
 }: Workspace = {}): Promise<ScopeReport[]> {
   const root = await mkdtemp(join(tmpdir(), "validate-"));
   roots.push(root);
@@ -76,7 +79,7 @@ async function validate({
   }
   for (const [path, content] of Object.entries(files)) await write(join(root, "fixtures", path), content);
   await write(join(root, "fixtures", "manifest.json"), JSON.stringify(manifest));
-  return validateTenants({ rootDir: root });
+  return validateTenants({ rootDir: root, ...(ids === undefined ? {} : { ids }) });
 }
 
 /** `severity code: message` for every issue of a scope, info excluded. */
@@ -206,6 +209,35 @@ describe("validateTenants", () => {
     expect(problems(reports)[0]).toBe(
       'error path_outside: orders/batch 1 "other/orders/batch_01.csv" is outside fixtures/acme: the load would stop before any file',
     );
+  });
+
+  it("rejects a requested id with no tenant file, suggesting the closest id", async () => {
+    const reports = await validate({ ids: ["ghost", "acmee"] });
+    expect(reports.map((r) => r.scope)).toEqual(["acmee", "ghost"]);
+    expect(problems(reports, "ghost")).toEqual(["error no_tenant_file: tenants/ghost.json does not exist"]);
+    expect(problems(reports, "acmee")).toEqual([
+      'error no_tenant_file: tenants/acmee.json does not exist (did you mean "acme"?)',
+    ]);
+    expect(exitStatus(reports)).toBe(2);
+  });
+
+  it("rejects when the tenants directory is missing, which the CLI maps to exit code 1", async () => {
+    const root = await mkdtemp(join(tmpdir(), "validate-"));
+    roots.push(root);
+    await expect(validateTenants({ rootDir: root })).rejects.toThrow(/ENOENT/);
+  });
+
+  it("warns on every configured source and every file on disk when the manifest is empty", async () => {
+    const reports = await validate({ manifest: { batches: [] } });
+    expect(problems(reports)).toEqual([
+      "warning no_manifest_entries: orders is configured but the manifest lists no batch for it",
+      "warning no_manifest_entries: email_events is configured but the manifest lists no batch for it",
+      "warning no_manifest_entries: ad_spend is configured but the manifest lists no batch for it",
+      "warning not_in_manifest: fixtures/acme/orders/batch_01.csv on disk but not in the manifest: it will not load",
+      "warning not_in_manifest: fixtures/acme/email_events/batch_01.ndjson on disk but not in the manifest: it will not load",
+      "warning not_in_manifest: fixtures/acme/ad_spend/batch_01.csv on disk but not in the manifest: it will not load",
+    ]);
+    expect(exitStatus(reports)).toBe(0);
   });
 });
 

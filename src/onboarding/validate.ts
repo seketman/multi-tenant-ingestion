@@ -110,6 +110,10 @@ function columnValue(record: RawRecord, columns: Record<string, string>, canonic
   for (const key of keys) {
     const value = record.payload[key];
     if (value === null || value === undefined) continue;
+    // An object or array is tallied under its JSON.stringify text, which need not be the text
+    // staging reads: `->>` on jsonb prints `{"a": 1}` for `{"a":1}` and orders keys shortest
+    // first. So such a value is not value-compared with staging. The mapped columns (channel,
+    // type, platform) only ever hold scalars today, so no current output depends on this.
     const text = (typeof value === "string" ? value : typeof value === "object" ? JSON.stringify(value) : String(value))
       // btrim with no characters argument removes spaces only, not tabs or newlines.
       .replace(/^ +| +$/g, "");
