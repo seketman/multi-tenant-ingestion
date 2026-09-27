@@ -65,6 +65,10 @@ export type MartName = keyof typeof MARTS;
 
 export const MART_NAMES = Object.keys(MARTS) as MartName[];
 
+/** The marts whose lineage includes `source`, in MARTS order. */
+export const martsBuiltFrom = (source: SourceName): MartName[] =>
+  MART_NAMES.filter((mart) => MARTS[mart].lineage.some((l: LineageSpec) => l.source === source));
+
 export interface PublishOptions {
   /** Tenants to publish, each in its own transaction. */
   tenants: TenantConfig[];

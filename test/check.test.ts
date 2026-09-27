@@ -10,6 +10,7 @@ import { upsertTenant } from "../src/db/seed.ts";
 import { checkSources, exitStatus, formatReport, type TenantHealth } from "../src/ingest/check.ts";
 import { loadBatches } from "../src/ingest/loader.ts";
 import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
+import { publishReports } from "../src/report/publish.ts";
 import { isSupplied } from "./supplied-tenants.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
@@ -27,6 +28,10 @@ afterAll(async () => {
     await withTenant(
       id,
       async (client) => {
+        // Only the published_incomplete tests publish; the deletes are no-ops for the other tenants.
+        await client.query("DELETE FROM ops.restatement WHERE tenant_id = $1", [id]);
+        await client.query("DELETE FROM ops.published_metric WHERE tenant_id = $1", [id]);
+        await client.query("DELETE FROM ops.report_run WHERE tenant_id = $1", [id]);
         await client.query("DELETE FROM raw.record WHERE tenant_id = $1", [id]);
         await client.query("DELETE FROM ops.batch_file WHERE tenant_id = $1", [id]);
         // ops.value_map arrives with a later migration; clean it only where it exists.
@@ -607,5 +612,138 @@ describe("source health check on synthetic tenants", () => {
       { kind: "no_manifest_entries", source: "orders" },
       { kind: "source_not_configured", source: "ad_spend" },
     ]);
+  });
+});
+
+describe("published keys inside an incomplete window", () => {
+  let root: string;
+  let ordersSource: TenantConfig["sources"];
+
+  const tenantFor = (name: string): TenantConfig => ({
+    id: `chk_${name}_${suffix}`,
+    displayName: name,
+    currency: "USD",
+    fixturesDir: `fixtures/chk_${name}_${suffix}`,
+    sources: ordersSource,
+  });
+  const ordersHeader = "order_id,created_at,channel,gross,currency,customer_email\n";
+  const order = (id: string, day: string) => `${id},${day}T10:00:00Z,google,10.00,USD,a@example.invalid\n`;
+  /** A manifest expecting orders batches `batches` of `tenant`, batch n covering 2026-03-(2n-1)..2026-03-(2n). */
+  const expecting = (tenant: TenantConfig, batches: number[]): Manifest => ({
+    batches: batches.map((batch) => ({
+      tenant: tenant.id,
+      source: "orders",
+      batch,
+      path: `${tenant.id}/orders/batch_0${batch}.csv`,
+      covers_from: `2026-03-${String(2 * batch - 1).padStart(2, "0")}`,
+      covers_to: `2026-03-${String(2 * batch).padStart(2, "0")}`,
+    })),
+  });
+  /** Writes orders batch files for `tenant`, keyed by batch number, and loads them. */
+  const loadOrders = async (tenant: TenantConfig, files: Record<number, string>): Promise<void> => {
+    for (const [batch, rows] of Object.entries(files)) {
+      const file = join(root, "fixtures", tenant.id, `orders/batch_0${batch}.csv`);
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, ordersHeader + rows);
+    }
+    await loadBatches({ tenants: [tenant], manifest: expecting(tenant, Object.keys(files).map(Number)), rootDir: root });
+  };
+  /** Publishes daily_revenue only, as a report run would with the manifest of what has fallen due so far. */
+  const publish = (tenant: TenantConfig, batches: number[]) =>
+    publishReports({ tenants: [tenant], marts: ["daily_revenue"], manifest: expecting(tenant, batches) });
+  const check = async (tenant: TenantConfig, batches: number[]) => {
+    const reports = await checkSources({ tenants: [tenant], manifest: expecting(tenant, batches) });
+    return { report: reportOf(reports, tenant.id), status: exitStatus(reports) };
+  };
+  const notReceived = (tenant: TenantConfig) => ({
+    kind: "not_received",
+    source: "orders",
+    batch: 2,
+    path: `${tenant.id}/orders/batch_02.csv`,
+    coversTo: "2026-03-04",
+  });
+
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), "check-published-"));
+    const northwindOrders = (await loadTenants()).find((t) => t.id === "northwind")?.sources.orders;
+    ordersSource = northwindOrders === undefined ? {} : { orders: northwindOrders };
+  });
+
+  afterAll(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("reports keys published before their window became incomplete, and clears once the batch loads", async () => {
+    const tenant = tenantFor("pubgap");
+    await register(tenant);
+    // Batch 1 also carries early orders for 2026-03-03 and 2026-03-04, published while batch 2 was not yet expected.
+    await loadOrders(tenant, { 1: order("o-1", "2026-03-01") + order("o-2", "2026-03-03") + order("o-3", "2026-03-04") });
+    await publish(tenant, [1]);
+
+    // Batch 2 is now expected and has not arrived; batch 3 has.
+    await loadOrders(tenant, { 3: order("o-5", "2026-03-05") });
+    const { report, status } = await check(tenant, [1, 2, 3]);
+    // daily_channel_performance is built from orders too, but nothing of it was published.
+    expect(report.findings).toEqual([
+      notReceived(tenant),
+      {
+        kind: "published_incomplete",
+        mart: "daily_revenue",
+        source: "orders",
+        batch: 2,
+        path: `${tenant.id}/orders/batch_02.csv`,
+        coversFrom: "2026-03-03",
+        coversTo: "2026-03-04",
+        status: "not_received",
+        keys: 2,
+        firstDay: "2026-03-03",
+        lastDay: "2026-03-04",
+      },
+    ]);
+    expect(formatReport([report])[2]).toBe(
+      `  published_incomplete: daily_revenue has 2 published keys from 2026-03-03 to 2026-03-04 inside orders/batch 2 (covers 2026-03-03 to 2026-03-04), which has not loaded (not_received)`,
+    );
+    expect(status).toBe(2);
+
+    // Once batch 2 loads the window is complete, so the finding clears without a report run. The
+    // published numbers may now be behind the marts; the next `pnpm report` restates them.
+    await loadOrders(tenant, { 2: order("o-4", "2026-03-04") });
+    const loaded = await check(tenant, [1, 2, 3]);
+    expect(loaded.report.findings).toEqual([]);
+    expect(loaded.status).toBe(0);
+  });
+
+  it("does not report a window whose marts have nothing published inside it", async () => {
+    const tenant = tenantFor("pubclean");
+    await register(tenant);
+    await loadOrders(tenant, { 1: order("o-1", "2026-03-01") });
+    // Before any report run, marts.reported_metric is empty.
+    await loadOrders(tenant, { 3: order("o-5", "2026-03-05") + order("o-9", "2026-03-03") });
+    expect((await check(tenant, [1, 2, 3])).report.findings).toEqual([notReceived(tenant)]);
+
+    // The run withholds 2026-03-03, so again nothing is published inside the window.
+    await publish(tenant, [1, 2, 3]);
+    const { report, status } = await check(tenant, [1, 2, 3]);
+    expect(report.findings).toEqual([notReceived(tenant)]);
+    expect(status).toBe(2);
+  });
+
+  it("names a window whose batch was only quarantined", async () => {
+    const tenant = tenantFor("pubquar");
+    await register(tenant);
+    await loadOrders(tenant, { 1: order("o-1", "2026-03-01") + order("o-2", "2026-03-03") });
+    await publish(tenant, [1]);
+
+    // Too few columns: the whole of batch 2 is quarantined.
+    await loadOrders(tenant, { 2: "o-4,2026-03-04T10:00:00Z,google\n", 3: order("o-5", "2026-03-05") });
+    const { report, status } = await check(tenant, [1, 2, 3]);
+    expect(report.findings).toEqual([
+      expect.objectContaining({ kind: "quarantined", source: "orders", batch: 2 }),
+      expect.objectContaining({ kind: "published_incomplete", mart: "daily_revenue", status: "quarantined", keys: 1 }),
+    ]);
+    expect(formatReport([report])[2]).toBe(
+      `  published_incomplete: daily_revenue has 1 published key on 2026-03-03 inside orders/batch 2 (covers 2026-03-03 to 2026-03-04), which has not loaded (quarantined)`,
+    );
+    expect(status).toBe(2);
   });
 });

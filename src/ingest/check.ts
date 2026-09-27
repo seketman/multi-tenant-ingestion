@@ -4,6 +4,8 @@ import { type ClosedColumn, canonicalValues, SOURCE_COLUMNS, SOURCE_NAMES, type 
 import { loadTenants, type TenantConfig } from "../config/tenants.ts";
 import { closePools, getAppPool } from "../db/pool.ts";
 import { withTenant } from "../db/tenant-scope.ts";
+import { type MartName, martsBuiltFrom } from "../report/publish.ts";
+import { type IncompleteWindow, incompleteWindows } from "./coverage.ts";
 import { describeError, headerAdaptations } from "./loader.ts";
 import { loadManifest, type Manifest, type ManifestEntry, manifestSchema } from "./manifest.ts";
 
@@ -41,6 +43,12 @@ export interface BatchHealth {
  * - uncounted_values: values of a closed column (CANONICAL_VALUES) outside its canonical
  *   set, e.g. an email event type with no value map entry. The marts count only canonical
  *   values, so these rows are loaded but never reported.
+ * - published_incomplete: keys still reported to the client (marts.reported_metric) whose
+ *   day lies inside the window of a manifest batch that has not loaded, for a source in
+ *   the mart's lineage, per window and mart. `pnpm report` withholds such keys, so these
+ *   versions were published before the window became incomplete and may lack that batch's
+ *   rows. They stay visible until the batch loads; the finding then clears, and the next
+ *   report run restates any key whose numbers moved.
  */
 export type Finding =
   | ({ kind: "not_received" } & Omit<BatchHealth, "status" | "reasonCodes">)
@@ -57,7 +65,16 @@ export type Finding =
       canonical: readonly string[];
       /** Staged rows per value outside `canonical`, most frequent first. */
       values: { value: string; rows: number }[];
-    };
+    }
+  | ({
+      kind: "published_incomplete";
+      mart: MartName;
+      /** Reported keys of `mart` dated inside the window. */
+      keys: number;
+      /** YYYY-MM-DD, the earliest and latest day among those keys. */
+      firstDay: string;
+      lastDay: string;
+    } & IncompleteWindow);
 
 /**
  * Something worth knowing that is not a problem, so it never changes the exit status:
@@ -183,11 +200,45 @@ async function stagingQuality(client: pg.PoolClient): Promise<{ findings: Findin
 }
 
 /**
+ * One published_incomplete finding per incomplete window and mart built from its source
+ * that has reported keys inside the window, bounds included, read in the caller's tenant
+ * scope. Windows in manifest order, marts in MARTS order.
+ */
+async function publishedIncomplete(client: pg.PoolClient, windows: IncompleteWindow[]): Promise<Finding[]> {
+  const findings: Finding[] = [];
+  for (const window of windows) {
+    const marts = martsBuiltFrom(window.source);
+    const { rows } = await client.query<{ mart: MartName; keys: number; first_day: string; last_day: string }>(
+      `SELECT mart, count(*)::integer AS keys,
+              to_char(min(day), 'YYYY-MM-DD') AS first_day, to_char(max(day), 'YYYY-MM-DD') AS last_day
+       FROM marts.reported_metric
+       WHERE mart = ANY($1) AND day BETWEEN $2::date AND $3::date
+       GROUP BY mart`,
+      [marts, window.coversFrom, window.coversTo],
+    );
+    for (const mart of marts) {
+      const hit = rows.find((r) => r.mart === mart);
+      if (hit === undefined) continue;
+      findings.push({
+        kind: "published_incomplete",
+        mart,
+        ...window,
+        keys: hit.keys,
+        firstDay: hit.first_day,
+        lastDay: hit.last_day,
+      });
+    }
+  }
+  return findings;
+}
+
+/**
  * Compares each tenant's manifest with its ledger (ops.batch_file), read inside that
  * tenant's scope, so row-level security keeps one tenant's rows out of another's report.
  * In the same scope it reads staging for data-quality findings (invalid_rows, uncounted_values)
- * and notes on invalid rows a later batch superseded. The ledger's loaded rows also yield
- * notes on headers read through declared aliases.
+ * and notes on invalid rows a later batch superseded, and marts.reported_metric for keys
+ * published inside the window of a batch that has not loaded (published_incomplete). The
+ * ledger's loaded rows also yield notes on headers read through declared aliases.
  * Read-only. Without `pool`, the shared application pool is used and the caller must
  * call `closePools()` when done, as the CLI below does.
  */
@@ -206,20 +257,24 @@ export async function checkSources({
     const entries = parsedManifest.batches
       .filter((e) => e.tenant === tenant.id)
       .sort((a, b) => SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source) || a.batch - b.batch);
-    const { ledger, quality } = await withTenant(
+    const { ledger, published, quality } = await withTenant(
       tenant.id,
-      async (client) => ({
-        ledger: (
+      async (client) => {
+        const ledger = (
           await client.query<LedgerRow>(
             "SELECT source, batch_no, status, detail FROM ops.batch_file ORDER BY source, batch_no, id",
           )
-        ).rows,
-        quality: await stagingQuality(client),
-      }),
+        ).rows;
+        return {
+          ledger,
+          published: await publishedIncomplete(client, incompleteWindows(entries, ledger)),
+          quality: await stagingQuality(client),
+        };
+      },
       pool,
     );
     const report = assess(tenant, entries, ledger, asOf);
-    report.findings.push(...quality.findings);
+    report.findings.push(...published, ...quality.findings);
     report.notes.push(...quality.notes);
     reports.push(report);
   }
@@ -311,9 +366,11 @@ function batchRanges(batches: number[]): string {
 /**
  * The process exit code for a run, which is what a scheduler alerts on:
  * - 0: every manifest batch is loaded, every configured source is current and staging
- *   has no current invalid rows or uncounted values.
+ *   has no current invalid rows or uncounted values. With every batch loaded, no window
+ *   is incomplete, so no published key can be inside one.
  * - 2: findings (a batch not received, quarantined or redelivered with other content, a
- *   stale or unlisted source, invalid rows or values the marts do not count).
+ *   stale or unlisted source, invalid rows or values the marts do not count, published
+ *   keys inside the window of a batch that has not loaded).
  * - 1 (set by the CLI, never returned here): the check itself failed, e.g. a bad
  *   manifest or an unreachable database, so nothing is known about the data.
  * Notes (a declared alias in use, invalid rows a later batch superseded) never affect it.
@@ -348,6 +405,13 @@ function formatFinding(f: Finding): string {
     case "uncounted_values": {
       const values = f.values.map((v) => `"${v.value}" ${v.rows} row${v.rows === 1 ? "" : "s"}`).join(", ");
       return `uncounted_values: ${f.source}.${f.column} ${values}, not one of ${f.canonical.join(", ")}`;
+    }
+    case "published_incomplete": {
+      const days = f.firstDay === f.lastDay ? `on ${f.firstDay}` : `from ${f.firstDay} to ${f.lastDay}`;
+      return (
+        `published_incomplete: ${f.mart} has ${f.keys} published key${f.keys === 1 ? "" : "s"} ${days} ` +
+        `inside ${f.source}/batch ${f.batch} (covers ${f.coversFrom} to ${f.coversTo}), which has not loaded (${f.status})`
+      );
     }
   }
 }
