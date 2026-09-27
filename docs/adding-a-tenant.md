@@ -165,7 +165,7 @@ A listed file that is absent is reported as `missing` by `pnpm load` and `not_re
 
 If something is off, these are the lines you will see (a tenant with clean data shows none of the findings):
 
-- `invalid_rows: orders.gross 1 row (first: batch 1 line 3)`: values that are missing or failed their cast, from `staging.invalid_rows`. They are left out of the marts' sums, and an order with a bad `gross` is still counted in `orders`. Lines a later batch superseded are counted too, so a corrected row keeps the finding until the database is reset.
+- `invalid_rows: orders.gross 1 row (first: batch 1 line 3)`: values that are missing or failed their cast and still reach the marts, from `staging.current_invalid_rows`. They are left out of the marts' sums, and an order with a bad `gross` is left out of `orders` too. A corrected row clears the finding and leaves a note instead: `note: orders.gross 1 invalid row superseded by a later batch`.
 - `uncounted_values: email_events.type "BOUNCE" 2 rows, not one of delivered, open, click, unsubscribe`: an event type the marts never count, usually a missing value-map entry. Add the entry and run `pnpm migrate`; the views follow the map right away.
 - `note: ad_spend batch 1 read header "cost" as spend (declared alias)`: a loaded batch read a header through one of your aliases. Notes are not findings and never change the exit code. `pnpm load` says the same on the file's line: `loaded: acme/ad_spend/batch 1 (<n> rows; header cost read as spend)`.
 
