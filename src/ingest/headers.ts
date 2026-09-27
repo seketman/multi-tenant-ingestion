@@ -41,7 +41,7 @@ export function resolveHeaders(
     if (column === undefined) {
       reasons.push({
         code: "unknown_header",
-        message: `header "${clip(header)}" is neither a ${source} column nor a declared alias`,
+        message: `header "${clip(header)}" is neither a column of ${source} nor a declared alias`,
       });
       continue;
     }
