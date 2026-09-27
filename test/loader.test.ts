@@ -75,6 +75,7 @@ afterAll(async () => {
       async (client) => {
         await client.query("DELETE FROM raw.record WHERE tenant_id = $1", [id]);
         await client.query("DELETE FROM ops.batch_file WHERE tenant_id = $1", [id]);
+        await client.query("DELETE FROM ops.value_map WHERE tenant_id = $1", [id]);
         await client.query("DELETE FROM ops.tenant WHERE tenant_id = $1", [id]);
       },
       owner,
