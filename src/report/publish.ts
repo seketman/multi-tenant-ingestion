@@ -72,7 +72,7 @@ export const martsBuiltFrom = (source: SourceName): MartName[] =>
 export interface PublishOptions {
   /** Tenants to publish, each in its own transaction. */
   tenants: TenantConfig[];
-  /** Marts to publish. Defaults to every mart in MARTS. */
+  /** Marts to publish, at least one. Defaults to every mart in MARTS. */
   marts?: MartName[];
   pool?: pg.Pool;
   /**
@@ -221,6 +221,8 @@ export async function publishReports({
   manifest,
   failAfterTenants,
 }: PublishOptions): Promise<PublishResult[]> {
+  // An empty list would build an empty UNION ALL, and every tenant would fail on it.
+  if (marts.length === 0) throw new Error("marts must list at least one mart");
   const unknown = marts.filter((m) => !Object.hasOwn(MARTS, m));
   if (unknown.length > 0) throw new Error(`Unknown marts: ${unknown.join(", ")}`);
   const parsedManifest =

@@ -542,3 +542,17 @@ describe("publishing reports on synthetic tenants", () => {
     );
   });
 });
+
+describe("publishReports options", () => {
+  it("rejects an empty marts list before touching the database", async () => {
+    const pool = {
+      connect: () => {
+        throw new Error("no database work expected");
+      },
+    } as unknown as pg.Pool;
+    const tenant = { id: "rpt_empty_marts" } as TenantConfig;
+    await expect(publishReports({ tenants: [tenant], marts: [], pool, manifest: { batches: [] } })).rejects.toThrow(
+      "marts must list at least one mart",
+    );
+  });
+});
