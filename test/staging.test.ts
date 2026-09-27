@@ -13,6 +13,10 @@ import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
 const suffix = randomBytes(4).toString("hex");
+// The tenants the supplied fixtures were written for. Suites that assert on those fixtures use only
+// these, so a tenant added to tenants/ and fixtures/manifest.json cannot change their expectations.
+const SUPPLIED = new Set(["lumen", "northwind"]);
+const isSupplied = (x: { id: string } | { tenant: string }) => SUPPLIED.has("id" in x ? x.id : x.tenant);
 const northwind = `northwind_${suffix}`;
 const lumen = `lumen_${suffix}`;
 const createdTenants: string[] = [];
@@ -64,9 +68,9 @@ afterAll(async () => {
 
 describe("staging and marts on the supplied fixtures", () => {
   beforeAll(async () => {
-    const tenants = (await loadTenants()).map((t) => ({ ...t, id: `${t.id}_${suffix}` }));
+    const tenants = (await loadTenants()).filter(isSupplied).map((t) => ({ ...t, id: `${t.id}_${suffix}` }));
     const real = await loadManifest("fixtures/manifest.json");
-    const manifest = { batches: real.batches.map((b) => ({ ...b, tenant: `${b.tenant}_${suffix}` })) };
+    const manifest = { batches: real.batches.filter(isSupplied).map((b) => ({ ...b, tenant: `${b.tenant}_${suffix}` })) };
     for (const tenant of tenants) await register(tenant);
     expect(statusCounts(await loadBatches({ tenants, manifest }))).toEqual({ loaded: 39, missing: 1 });
   }, 60_000);
@@ -232,10 +236,10 @@ describe("staging and marts on the supplied fixtures", () => {
 describe("a third tenant added by configuration only", () => {
   let root: string;
   const tenant: TenantConfig = {
-    id: `acme_${suffix}`,
+    id: `t_acme_${suffix}`,
     displayName: "Acme",
     currency: "GBP",
-    fixturesDir: `fixtures/acme_${suffix}`,
+    fixturesDir: `fixtures/t_acme_${suffix}`,
     sources: {
       orders: {
         columnAliases: { gross: ["total_amount"] },

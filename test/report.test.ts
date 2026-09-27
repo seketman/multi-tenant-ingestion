@@ -13,6 +13,10 @@ import { MART_NAMES, MARTS, type PublishResult, publishReports } from "../src/re
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
 const suffix = randomBytes(4).toString("hex");
+// The tenants the supplied fixtures were written for. Suites that assert on those fixtures use only
+// these, so a tenant added to tenants/ and fixtures/manifest.json cannot change their expectations.
+const SUPPLIED = new Set(["lumen", "northwind"]);
+const isSupplied = (x: { id: string } | { tenant: string }) => SUPPLIED.has("id" in x ? x.id : x.tenant);
 const northwind = `northwind_${suffix}`;
 const lumen = `lumen_${suffix}`;
 const createdTenants: string[] = [];
@@ -103,9 +107,9 @@ describe("publishing reports on the supplied fixtures, with batch 5 arriving lat
   let second: PublishResult[];
 
   beforeAll(async () => {
-    tenants = (await loadTenants()).map((t) => ({ ...t, id: `${t.id}_${suffix}` }));
+    tenants = (await loadTenants()).filter(isSupplied).map((t) => ({ ...t, id: `${t.id}_${suffix}` }));
     const real = await loadManifest("fixtures/manifest.json");
-    manifest = { batches: real.batches.map((b) => ({ ...b, tenant: `${b.tenant}_${suffix}` })) };
+    manifest = { batches: real.batches.filter(isSupplied).map((b) => ({ ...b, tenant: `${b.tenant}_${suffix}` })) };
     for (const tenant of tenants) await register(tenant);
 
     await loadBatches({ tenants, manifest: { batches: manifest.batches.filter((b) => b.batch <= 4) } });

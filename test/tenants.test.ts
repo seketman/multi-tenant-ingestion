@@ -7,10 +7,13 @@ import { loadTenants, tenantConfigSchema } from "../src/config/tenants.ts";
 describe("tenant config", () => {
   it("loads and validates every tenant file", async () => {
     const tenants = await loadTenants();
-    expect(tenants.map((t) => [t.id, t.currency])).toEqual([
-      ["lumen", "EUR"],
-      ["northwind", "USD"],
-    ]);
+    // Other tenants may sit next to the supplied ones: loadTenants still validates every file, and the loop checks each fixturesDir.
+    expect(tenants.map((t) => [t.id, t.currency])).toEqual(
+      expect.arrayContaining([
+        ["lumen", "EUR"],
+        ["northwind", "USD"],
+      ]),
+    );
     for (const tenant of tenants) {
       expect((await stat(tenant.fixturesDir)).isDirectory()).toBe(true);
     }

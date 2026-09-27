@@ -19,6 +19,10 @@ import { parseBatchFile } from "../src/ingest/parse.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
 const suffix = randomBytes(4).toString("hex");
+// The tenants the supplied fixtures were written for. Suites that assert on those fixtures use only
+// these, so a tenant added to tenants/ and fixtures/manifest.json cannot change their expectations.
+const SUPPLIED = new Set(["lumen", "northwind"]);
+const isSupplied = (x: { id: string } | { tenant: string }) => SUPPLIED.has("id" in x ? x.id : x.tenant);
 const createdTenants: string[] = [];
 
 const register = async (tenant: TenantConfig) => {
@@ -54,9 +58,9 @@ const rawCount = async (tenantId: string): Promise<number> =>
 
 /** The supplied tenants and manifest under ids ending in `_<tag>`, registered in the database. */
 const fixturesAs = async (tag: string): Promise<{ tenants: TenantConfig[]; manifest: Manifest }> => {
-  const tenants = (await loadTenants()).map((t) => ({ ...t, id: `${t.id}_${tag}` }));
+  const tenants = (await loadTenants()).filter(isSupplied).map((t) => ({ ...t, id: `${t.id}_${tag}` }));
   const real = await loadManifest("fixtures/manifest.json");
-  const manifest = { batches: real.batches.map((b) => ({ ...b, tenant: `${b.tenant}_${tag}` })) };
+  const manifest = { batches: real.batches.filter(isSupplied).map((b) => ({ ...b, tenant: `${b.tenant}_${tag}` })) };
   for (const tenant of tenants) await register(tenant);
   return { tenants, manifest };
 };
@@ -222,10 +226,10 @@ describe("raw loader on problem files", () => {
   let root: string;
   let northwindSources: TenantConfig["sources"];
   const tenantFor = (name: string): TenantConfig => ({
-    id: `${name}_${suffix}`,
+    id: `t_${name}_${suffix}`,
     displayName: name,
     currency: "USD",
-    fixturesDir: `fixtures/${name}_${suffix}`,
+    fixturesDir: `fixtures/t_${name}_${suffix}`,
     sources: northwindSources,
   });
   const put = async (tenant: TenantConfig, path: string, text: string) => {
@@ -465,10 +469,10 @@ describe("raw loader on problem files", () => {
     const tenant = tenantFor("escape");
     await register(tenant);
     await put(tenant, "refunds/batch_01.csv", refunds(1));
-    const outside = { ...entry(tenant, "refunds", 2, "refunds/batch_01.csv"), path: `drift_${suffix}/refunds/batch_01.csv` };
+    const outside = { ...entry(tenant, "refunds", 2, "refunds/batch_01.csv"), path: `t_drift_${suffix}/refunds/batch_01.csv` };
 
     await expect(load(tenant, [entry(tenant, "refunds", 1, "refunds/batch_01.csv"), outside])).rejects.toThrow(
-      /is outside fixtures\/escape_/,
+      /is outside fixtures\/t_escape_/,
     );
     expect(await ledger(tenant.id)).toEqual([]);
   });
