@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import type pg from "pg";
-import { SOURCE_NAMES, type SourceName } from "../config/sources.ts";
+import { type ClosedColumn, canonicalValues, SOURCE_COLUMNS, SOURCE_NAMES, type SourceName } from "../config/sources.ts";
 import { loadTenants, type TenantConfig } from "../config/tenants.ts";
 import { closePools, getAppPool } from "../db/pool.ts";
 import { withTenant } from "../db/tenant-scope.ts";
@@ -33,6 +33,12 @@ export interface BatchHealth {
  * - stale: a configured source whose loaded data ends before `asOf` (`freshThrough` null: nothing loaded).
  * - no_manifest_entries: a configured source the manifest lists no batch for.
  * - source_not_configured: the manifest lists batches for a source the tenant has not configured.
+ * - invalid_rows: loaded lines whose required column is missing or fails its cast
+ *   (staging.invalid_rows), per source and column. Staging nulls the value or drops the
+ *   row, so the marts under-count without failing. Superseded lines count too, as in the view.
+ * - uncounted_values: values of a closed column (CANONICAL_VALUES) outside its canonical
+ *   set, e.g. an email event type with no value map entry. The marts count only canonical
+ *   values, so these rows are loaded but never reported.
  */
 export type Finding =
   | ({ kind: "not_received" } & Omit<BatchHealth, "status" | "reasonCodes">)
@@ -40,7 +46,16 @@ export type Finding =
   | ({ kind: "conflicting_redelivery"; reasonCodes: string[] } & Omit<BatchHealth, "status" | "reasonCodes">)
   | { kind: "stale"; source: SourceName; freshThrough: string | null; asOf: string }
   | { kind: "no_manifest_entries"; source: SourceName }
-  | { kind: "source_not_configured"; source: SourceName };
+  | { kind: "source_not_configured"; source: SourceName }
+  | { kind: "invalid_rows"; source: SourceName; column: string; rows: number; firstBatch: number; firstLine: number }
+  | {
+      kind: "uncounted_values";
+      source: SourceName;
+      column: string;
+      canonical: readonly string[];
+      /** Staged rows per value outside `canonical`, most frequent first. */
+      values: { value: string; rows: number }[];
+    };
 
 export interface TenantHealth {
   tenant: string;
@@ -73,9 +88,70 @@ interface LedgerRow {
   detail: { reasons?: { code: string }[] } | null;
 }
 
+interface InvalidRowsRow {
+  source: SourceName;
+  column_name: string;
+  rows: number;
+  first_batch: number;
+  first_line: number;
+}
+
+/**
+ * Where each closed column's mapped value lands in staging, which is what the marts read.
+ * Keyed by ClosedColumn, so declaring a new closed column without saying where to look
+ * for it fails to compile. Identifiers come only from this constant, never from input.
+ */
+const STAGED_COLUMN: Record<ClosedColumn, { view: string; column: string }> = {
+  "email_events.type": { view: "staging.email_events", column: "event_type" },
+};
+
+/** Data-quality findings from staging, read in the caller's tenant scope. */
+async function stagingFindings(client: pg.PoolClient): Promise<Finding[]> {
+  const findings: Finding[] = [];
+  const invalid = (
+    await client.query<InvalidRowsRow>(
+      `SELECT source, column_name, count(*)::integer AS rows,
+              (array_agg(batch_no ORDER BY batch_no, line_no))[1] AS first_batch,
+              (array_agg(line_no ORDER BY batch_no, line_no))[1] AS first_line
+       FROM staging.invalid_rows GROUP BY source, column_name`,
+    )
+  ).rows;
+  const columnOrder = (r: InvalidRowsRow) => (SOURCE_COLUMNS[r.source] as readonly string[]).indexOf(r.column_name);
+  invalid.sort((a, b) => SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source) || columnOrder(a) - columnOrder(b));
+  for (const r of invalid) {
+    findings.push({
+      kind: "invalid_rows",
+      source: r.source,
+      column: r.column_name,
+      rows: r.rows,
+      firstBatch: r.first_batch,
+      firstLine: r.first_line,
+    });
+  }
+
+  for (const source of SOURCE_NAMES) {
+    for (const [column, canonical] of Object.entries(canonicalValues(source))) {
+      if (canonical === undefined) continue;
+      const staged = STAGED_COLUMN[`${source}.${column}` as ClosedColumn];
+      // A missing value is already an invalid_rows finding; only present, non-canonical ones count here.
+      const values = (
+        await client.query<{ value: string; rows: number }>(
+          `SELECT ${staged.column} AS value, count(*)::integer AS rows FROM ${staged.view}
+           WHERE ${staged.column} IS NOT NULL AND NOT (${staged.column} = ANY($1::text[]))
+           GROUP BY 1 ORDER BY 2 DESC, 1`,
+          [canonical],
+        )
+      ).rows;
+      if (values.length > 0) findings.push({ kind: "uncounted_values", source, column, canonical, values });
+    }
+  }
+  return findings;
+}
+
 /**
  * Compares each tenant's manifest with its ledger (ops.batch_file), read inside that
  * tenant's scope, so row-level security keeps one tenant's rows out of another's report.
+ * In the same scope it reads staging for data-quality findings (invalid_rows, uncounted_values).
  * Read-only. Without `pool`, the shared application pool is used and the caller must
  * call `closePools()` when done, as the CLI below does.
  */
@@ -94,17 +170,21 @@ export async function checkSources({
     const entries = parsedManifest.batches
       .filter((e) => e.tenant === tenant.id)
       .sort((a, b) => SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source) || a.batch - b.batch);
-    const ledger = await withTenant(
+    const { ledger, quality } = await withTenant(
       tenant.id,
-      async (client) =>
-        (
+      async (client) => ({
+        ledger: (
           await client.query<LedgerRow>(
             "SELECT source, batch_no, status, detail FROM ops.batch_file ORDER BY source, batch_no, id",
           )
         ).rows,
+        quality: await stagingFindings(client),
+      }),
       pool,
     );
-    reports.push(assess(tenant, entries, ledger, asOf));
+    const report = assess(tenant, entries, ledger, asOf);
+    report.findings.push(...quality);
+    reports.push(report);
   }
   return reports;
 }
@@ -161,9 +241,10 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
 
 /**
  * The process exit code for a run, which is what a scheduler alerts on:
- * - 0: every manifest batch is loaded and every configured source is current.
+ * - 0: every manifest batch is loaded, every configured source is current and staging
+ *   has no invalid rows or uncounted values.
  * - 2: findings (a batch not received, quarantined or redelivered with other content, a
- *   stale or unlisted source).
+ *   stale or unlisted source, invalid rows or values the marts do not count).
  * - 1 (set by the CLI, never returned here): the check itself failed, e.g. a bad
  *   manifest or an unreachable database, so nothing is known about the data.
  */
@@ -183,6 +264,12 @@ function formatFinding(f: Finding): string {
       return `no_manifest_entries: ${f.source} is configured but the manifest lists no batch for it`;
     case "source_not_configured":
       return `source_not_configured: the manifest lists ${f.source}, which this tenant has not configured`;
+    case "invalid_rows":
+      return `invalid_rows: ${f.source}.${f.column} ${f.rows} row${f.rows === 1 ? "" : "s"} (first: batch ${f.firstBatch} line ${f.firstLine})`;
+    case "uncounted_values": {
+      const values = f.values.map((v) => `"${v.value}" ${v.rows} row${v.rows === 1 ? "" : "s"}`).join(", ");
+      return `uncounted_values: ${f.source}.${f.column} ${values}, not one of ${f.canonical.join(", ")}`;
+    }
   }
 }
 

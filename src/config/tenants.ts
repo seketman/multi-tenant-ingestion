@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, isAbsolute, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { SOURCE_COLUMNS, SOURCE_NAMES, type SourceName } from "./sources.ts";
+import { canonicalValues, SOURCE_COLUMNS, SOURCE_NAMES, type SourceName } from "./sources.ts";
 
 const DEFAULT_TENANTS_DIR = fileURLToPath(new URL("../../tenants/", import.meta.url));
 
@@ -12,10 +12,13 @@ const DEFAULT_TENANTS_DIR = fileURLToPath(new URL("../../tenants/", import.meta.
  *   The canonical name itself is always accepted, so listing it is rejected as redundant.
  *   Every alias must resolve to exactly one canonical column: an alias may appear only
  *   once across the source and may not be another canonical column's name.
- * - valueMaps: canonical column -> raw value -> canonical value.
+ * - valueMaps: canonical column -> raw value -> canonical value. For a column with closed
+ *   semantics (CANONICAL_VALUES), every target must be one of its canonical values: a typo
+ *   would otherwise load fine and never be counted.
  */
 const sourceMappingSchema = (source: SourceName) => {
   const columns: readonly string[] = SOURCE_COLUMNS[source];
+  const closed = canonicalValues(source);
   const column = z.enum(SOURCE_COLUMNS[source]);
   return z
     .object({
@@ -23,7 +26,7 @@ const sourceMappingSchema = (source: SourceName) => {
       valueMaps: z.partialRecord(column, z.record(z.string(), z.string())).optional(),
     })
     .strict()
-    .superRefine(({ columnAliases }, ctx) => {
+    .superRefine(({ columnAliases, valueMaps }, ctx) => {
       const owner = new Map<string, string>();
       for (const [canonical, aliases] of Object.entries(columnAliases) as [string, string[] | undefined][]) {
         for (const alias of aliases ?? []) {
@@ -52,6 +55,19 @@ const sourceMappingSchema = (source: SourceName) => {
             });
           } else {
             owner.set(alias, canonical);
+          }
+        }
+      }
+      for (const [canonical, map] of Object.entries(valueMaps ?? {}) as [string, Record<string, string> | undefined][]) {
+        const allowed = closed[canonical];
+        if (allowed === undefined) continue;
+        for (const [raw, target] of Object.entries(map ?? {})) {
+          if (!allowed.includes(target)) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["valueMaps", canonical, raw],
+              message: `value map target "${target}" for ${source}.${canonical} is not one of ${allowed.join(", ")}`,
+            });
           }
         }
       }

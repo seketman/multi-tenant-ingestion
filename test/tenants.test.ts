@@ -71,6 +71,24 @@ describe("tenant config", () => {
     expect(issues(config)).toEqual([]);
   });
 
+  it("rejects a value map target outside a closed column's canonical values", () => {
+    const messages = issues(
+      withSources({ email_events: { valueMaps: { type: { OPEN: "open", Opened: "opened" } } } }),
+    );
+    expect(messages).toEqual([
+      'value map target "opened" for email_events.type is not one of delivered, open, click, unsubscribe',
+    ]);
+  });
+
+  it("allows any value map target for an open column", () => {
+    // A new client's new channel or platform is configuration only.
+    const config = withSources({
+      orders: { valueMaps: { channel: { TikTok: "tiktok" } } },
+      ad_spend: { valueMaps: { platform: { TikTok: "tiktok" } } },
+    });
+    expect(issues(config)).toEqual([]);
+  });
+
   it.each(["/etc/acme", "C:\\data\\acme", "../outside", "fixtures/../../outside", "fixtures\\..\\x"])(
     "rejects fixturesDir %s",
     (dir) => {

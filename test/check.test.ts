@@ -152,6 +152,7 @@ describe("source health check on the supplied fixtures", () => {
 describe("source health check on synthetic tenants", () => {
   let root: string;
   let northwindSources: TenantConfig["sources"];
+  let lumenSources: TenantConfig["sources"];
 
   const tenantFor = (name: string, sources: SourceName[]): TenantConfig => ({
     id: `chk_${name}_${suffix}`,
@@ -182,7 +183,9 @@ describe("source health check on synthetic tenants", () => {
 
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), "check-"));
-    northwindSources = (await loadTenants()).find((t) => t.id === "northwind")?.sources ?? {};
+    const supplied = await loadTenants();
+    northwindSources = supplied.find((t) => t.id === "northwind")?.sources ?? {};
+    lumenSources = supplied.find((t) => t.id === "lumen")?.sources ?? {};
   });
 
   afterAll(async () => {
@@ -262,6 +265,52 @@ describe("source health check on synthetic tenants", () => {
     ]);
     expect(formatReport([report])[1]).toBe(
       "  conflicting_redelivery: ad_spend/batch 1 is loaded, but a later delivery with different content was quarantined (batch_conflict)",
+    );
+    expect(status).toBe(2);
+  });
+
+  it("reports loaded rows whose required value failed its cast", async () => {
+    const tenant = tenantFor("badgross", ["orders"]);
+    await put(
+      tenant,
+      "orders/batch_01.csv",
+      "order_id,created_at,channel,gross,currency,customer_email\n" +
+        "o-1,2026-01-06T00:00:00Z,direct,10.00,USD,a@example.com\n" +
+        "o-2,2026-01-06T00:00:00Z,direct,12.5O,USD,b@example.com\n",
+    );
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "orders", 1, "orders/batch_01.csv", "2026-01-11"),
+    ]);
+    expect(report.batches.map((b) => [b.batch, b.status])).toEqual([[1, "loaded"]]);
+    expect(report.findings).toEqual([
+      { kind: "invalid_rows", source: "orders", column: "gross", rows: 1, firstBatch: 1, firstLine: 3 },
+    ]);
+    expect(formatReport([report])[1]).toBe("  invalid_rows: orders.gross 1 row (first: batch 1 line 3)");
+    expect(status).toBe(2);
+  });
+
+  it("reports email event types with no value map entry, which the marts never count", async () => {
+    // Lumen's map covers CLICK, OPEN, DELIVERED and UNSUBSCRIBE; BOUNCE has no entry and stays raw.
+    const tenant: TenantConfig = { ...tenantFor("unmapped", []), sources: { email_events: lumenSources.email_events } };
+    const event = (id: string, type: string) =>
+      `${JSON.stringify({ event_id: id, type, email: "a@example.com", campaign_id: "c-1", occurred_at: "2026-01-06T00:00:00Z" })}\n`;
+    await put(tenant, "email_events/batch_01.ndjson", event("e-1", "OPEN") + event("e-2", "BOUNCE") + event("e-3", "BOUNCE"));
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "email_events", 1, "email_events/batch_01.ndjson", "2026-01-11"),
+    ]);
+    expect(report.findings).toEqual([
+      {
+        kind: "uncounted_values",
+        source: "email_events",
+        column: "type",
+        canonical: ["delivered", "open", "click", "unsubscribe"],
+        values: [{ value: "BOUNCE", rows: 2 }],
+      },
+    ]);
+    expect(formatReport([report])[1]).toBe(
+      '  uncounted_values: email_events.type "BOUNCE" 2 rows, not one of delivered, open, click, unsubscribe',
     );
     expect(status).toBe(2);
   });
