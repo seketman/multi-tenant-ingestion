@@ -29,6 +29,19 @@ ops.*  control plane: tenants, value maps, batch file ledger, report runs,
 
 All four layers are tenant-scoped with `FORCE ROW LEVEL SECURITY` (RLS). Adding a tenant is configuration only: see [docs/adding-a-tenant.md](docs/adding-a-tenant.md). Design decisions and what is unfinished are in [TRADEOFFS.md](TRADEOFFS.md).
 
+## Walkthrough
+
+I did not record a walkthrough video. That was a choice: I spent the time on hardening from an external review instead. [docs/walkthrough.md](docs/walkthrough.md) replaces the video. It covers the same ground as the planned script, with every command, the expected output and numbers, and where to look in the code, so it can be reproduced from a clean checkout. I am happy to run it live.
+
+The hardening commits:
+
+- `49b66be` fix(ingest): keep `__proto__` headers and value maps from vanishing
+- `207ce7f` fix(docker): bind Postgres to loopback only
+- `cfaccb9` fix(report): reject an empty marts list before any database work
+- `baf3e16` fix(config): name the file on a JSON syntax error
+- `145367c` test(onboarding): cover missing ids, a missing tenants dir and an empty manifest
+- `d681b6d` refactor(ingest): replace nested ternaries in the loader with early returns
+
 ## Status
 
 I went deep on two areas: loading that is safe to rerun, and tenant isolation enforced by the database. The rest is built and tested, with the gaps below. Each gap is explained in [TRADEOFFS.md](TRADEOFFS.md#known-gaps).
