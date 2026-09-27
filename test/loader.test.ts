@@ -16,13 +16,10 @@ import {
 } from "../src/ingest/loader.ts";
 import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
 import { parseBatchFile } from "../src/ingest/parse.ts";
+import { isSupplied } from "./supplied-tenants.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
 const suffix = randomBytes(4).toString("hex");
-// The tenants the supplied fixtures were written for. Suites that assert on those fixtures use only
-// these, so a tenant added to tenants/ and fixtures/manifest.json cannot change their expectations.
-const SUPPLIED = new Set(["lumen", "northwind"]);
-const isSupplied = (x: { id: string } | { tenant: string }) => SUPPLIED.has("id" in x ? x.id : x.tenant);
 const createdTenants: string[] = [];
 
 const register = async (tenant: TenantConfig) => {
@@ -225,6 +222,8 @@ describe("daily gross from the raw layer", () => {
 describe("raw loader on problem files", () => {
   let root: string;
   let northwindSources: TenantConfig["sources"];
+  // The t_ prefix keeps synthetic tenants (and their fixturesDir) clear of any tenant added
+  // by hand, such as "acme" from docs/adding-a-tenant.md.
   const tenantFor = (name: string): TenantConfig => ({
     id: `t_${name}_${suffix}`,
     displayName: name,

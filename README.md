@@ -145,8 +145,7 @@ Both tenants renamed `spend` to `cost_usd` from `ad_spend` batch 4. The tenant f
 
 ```sh
 pnpm db:reset && pnpm migrate
-# remove the declared alias: sources.ad_spend.columnAliases becomes {}
-node -e 'const fs=require("fs"),p="tenants/northwind.json",c=JSON.parse(fs.readFileSync(p));c.sources.ad_spend.columnAliases={};fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n")'
+# edit tenants/northwind.json: under sources.ad_spend, change "columnAliases" to {}
 pnpm load
 # quarantined: northwind/ad_spend/batch 4 (unknown_header: header "cost_usd" is neither a column of ad_spend nor a declared alias; missing_column: column "spend" is missing)
 # quarantined: northwind/ad_spend/batch 5 (...same reasons...)

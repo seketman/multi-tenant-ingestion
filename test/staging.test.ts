@@ -10,13 +10,10 @@ import { appDatabaseUrl, closePools, getOwnerPool, withTenant } from "../src/db/
 import { upsertTenant } from "../src/db/seed.ts";
 import { type FileResult, loadBatches } from "../src/ingest/loader.ts";
 import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
+import { isSupplied } from "./supplied-tenants.ts";
 
 // Unique tenants per run keep the test re-runnable and away from the seeded 'northwind' and 'lumen'.
 const suffix = randomBytes(4).toString("hex");
-// The tenants the supplied fixtures were written for. Suites that assert on those fixtures use only
-// these, so a tenant added to tenants/ and fixtures/manifest.json cannot change their expectations.
-const SUPPLIED = new Set(["lumen", "northwind"]);
-const isSupplied = (x: { id: string } | { tenant: string }) => SUPPLIED.has("id" in x ? x.id : x.tenant);
 const northwind = `northwind_${suffix}`;
 const lumen = `lumen_${suffix}`;
 const createdTenants: string[] = [];
@@ -235,6 +232,8 @@ describe("staging and marts on the supplied fixtures", () => {
 
 describe("a third tenant added by configuration only", () => {
   let root: string;
+  // The t_ prefix keeps this synthetic tenant clear of an "acme" added by hand from
+  // docs/adding-a-tenant.md, whose example config it mirrors.
   const tenant: TenantConfig = {
     id: `t_acme_${suffix}`,
     displayName: "Acme",
