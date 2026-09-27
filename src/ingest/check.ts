@@ -33,9 +33,11 @@ export interface BatchHealth {
  * - stale: a configured source whose loaded data ends before `asOf` (`freshThrough` null: nothing loaded).
  * - no_manifest_entries: a configured source the manifest lists no batch for.
  * - source_not_configured: the manifest lists batches for a source the tenant has not configured.
- * - invalid_rows: loaded lines whose required column is missing or fails its cast
- *   (staging.invalid_rows), per source and column. Staging nulls the value or drops the
- *   row, so the marts under-count without failing. Superseded lines count too, as in the view.
+ * - invalid_rows: loaded lines whose required column is missing or fails its cast and that
+ *   still reach the marts (staging.current_invalid_rows), per source and column. Staging
+ *   nulls the value or drops the row, so the marts under-count without failing. A line a
+ *   later batch superseded is a superseded_invalid_rows note instead, so a corrected row
+ *   clears the finding.
  * - uncounted_values: values of a closed column (CANONICAL_VALUES) outside its canonical
  *   set, e.g. an email event type with no value map entry. The marts count only canonical
  *   values, so these rows are loaded but never reported.
@@ -62,8 +64,13 @@ export type Finding =
  * - declared_alias: loaded batches that read a header through an alias the tenant declared
  *   (ops.batch_file.detail.columns), e.g. `cost_usd` read as `spend`. The drift is expected,
  *   but it stays visible. `batches` are ascending batch numbers of that source.
+ * - superseded_invalid_rows: invalid lines (staging.invalid_rows) whose natural key a later
+ *   line restated, so they no longer reach the marts, per source and column. The bad
+ *   delivery stays visible after it was corrected, without keeping the check failing.
  */
-export type Note = { kind: "declared_alias"; source: SourceName; header: string; column: string; batches: number[] };
+export type Note =
+  | { kind: "declared_alias"; source: SourceName; header: string; column: string; batches: number[] }
+  | { kind: "superseded_invalid_rows"; source: SourceName; column: string; rows: number };
 
 export interface TenantHealth {
   tenant: string;
@@ -105,6 +112,12 @@ interface InvalidRowsRow {
   first_line: number;
 }
 
+/** Orders rows by source (SOURCE_NAMES), then by column (SOURCE_COLUMNS). */
+const bySourceAndColumn = (a: { source: SourceName; column_name: string }, b: { source: SourceName; column_name: string }) =>
+  SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source) ||
+  (SOURCE_COLUMNS[a.source] as readonly string[]).indexOf(a.column_name) -
+    (SOURCE_COLUMNS[b.source] as readonly string[]).indexOf(b.column_name);
+
 /**
  * Where each closed column's mapped value lands in staging, which is what the marts read.
  * Keyed by ClosedColumn, so declaring a new closed column without saying where to look
@@ -114,19 +127,18 @@ const STAGED_COLUMN: Record<ClosedColumn, { view: string; column: string }> = {
   "email_events.type": { view: "staging.email_events", column: "event_type" },
 };
 
-/** Data-quality findings from staging, read in the caller's tenant scope. */
-async function stagingFindings(client: pg.PoolClient): Promise<Finding[]> {
+/** Data-quality findings and notes from staging, read in the caller's tenant scope. */
+async function stagingQuality(client: pg.PoolClient): Promise<{ findings: Finding[]; notes: Note[] }> {
   const findings: Finding[] = [];
   const invalid = (
     await client.query<InvalidRowsRow>(
       `SELECT source, column_name, count(*)::integer AS rows,
               (array_agg(batch_no ORDER BY batch_no, line_no))[1] AS first_batch,
               (array_agg(line_no ORDER BY batch_no, line_no))[1] AS first_line
-       FROM staging.invalid_rows GROUP BY source, column_name`,
+       FROM staging.current_invalid_rows GROUP BY source, column_name`,
     )
   ).rows;
-  const columnOrder = (r: InvalidRowsRow) => (SOURCE_COLUMNS[r.source] as readonly string[]).indexOf(r.column_name);
-  invalid.sort((a, b) => SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source) || columnOrder(a) - columnOrder(b));
+  invalid.sort(bySourceAndColumn);
   for (const r of invalid) {
     findings.push({
       kind: "invalid_rows",
@@ -154,14 +166,28 @@ async function stagingFindings(client: pg.PoolClient): Promise<Finding[]> {
       if (values.length > 0) findings.push({ kind: "uncounted_values", source, column, canonical, values });
     }
   }
-  return findings;
+
+  // Every invalid line minus the current ones: what a later batch has since superseded.
+  const superseded = (
+    await client.query<{ source: SourceName; column_name: string; rows: number }>(
+      `SELECT source, column_name, count(*)::integer AS rows
+       FROM (SELECT * FROM staging.invalid_rows EXCEPT ALL SELECT * FROM staging.current_invalid_rows) s
+       GROUP BY source, column_name`,
+    )
+  ).rows;
+  superseded.sort(bySourceAndColumn);
+  const notes = superseded.map(
+    (r): Note => ({ kind: "superseded_invalid_rows", source: r.source, column: r.column_name, rows: r.rows }),
+  );
+  return { findings, notes };
 }
 
 /**
  * Compares each tenant's manifest with its ledger (ops.batch_file), read inside that
  * tenant's scope, so row-level security keeps one tenant's rows out of another's report.
- * In the same scope it reads staging for data-quality findings (invalid_rows, uncounted_values).
- * The ledger's loaded rows also yield notes on headers read through declared aliases.
+ * In the same scope it reads staging for data-quality findings (invalid_rows, uncounted_values)
+ * and notes on invalid rows a later batch superseded. The ledger's loaded rows also yield
+ * notes on headers read through declared aliases.
  * Read-only. Without `pool`, the shared application pool is used and the caller must
  * call `closePools()` when done, as the CLI below does.
  */
@@ -188,12 +214,13 @@ export async function checkSources({
             "SELECT source, batch_no, status, detail FROM ops.batch_file ORDER BY source, batch_no, id",
           )
         ).rows,
-        quality: await stagingFindings(client),
+        quality: await stagingQuality(client),
       }),
       pool,
     );
     const report = assess(tenant, entries, ledger, asOf);
-    report.findings.push(...quality);
+    report.findings.push(...quality.findings);
+    report.notes.push(...quality.notes);
     reports.push(report);
   }
   return reports;
@@ -255,7 +282,7 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
  * is left out of the batch list. Sources in SOURCE_NAMES order, headers as first seen.
  */
 function aliasNotes(ledger: LedgerRow[]): Note[] {
-  const notes = new Map<string, Note>();
+  const notes = new Map<string, Extract<Note, { kind: "declared_alias" }>>();
   for (const row of ledger) {
     if (row.status !== "loaded") continue;
     for (const { header, column } of headerAdaptations(row.detail?.columns ?? {})) {
@@ -284,17 +311,22 @@ function batchRanges(batches: number[]): string {
 /**
  * The process exit code for a run, which is what a scheduler alerts on:
  * - 0: every manifest batch is loaded, every configured source is current and staging
- *   has no invalid rows or uncounted values.
+ *   has no current invalid rows or uncounted values.
  * - 2: findings (a batch not received, quarantined or redelivered with other content, a
  *   stale or unlisted source, invalid rows or values the marts do not count).
  * - 1 (set by the CLI, never returned here): the check itself failed, e.g. a bad
  *   manifest or an unreachable database, so nothing is known about the data.
- * Notes (e.g. a declared alias in use) are expected drift and never affect it.
+ * Notes (a declared alias in use, invalid rows a later batch superseded) never affect it.
  */
 export const exitStatus = (reports: TenantHealth[]): 0 | 2 => (reports.some((r) => r.findings.length > 0) ? 2 : 0);
 
 function formatNote(n: Note): string {
-  return `note: ${n.source} ${batchRanges(n.batches)} read header "${n.header}" as ${n.column} (declared alias)`;
+  switch (n.kind) {
+    case "declared_alias":
+      return `note: ${n.source} ${batchRanges(n.batches)} read header "${n.header}" as ${n.column} (declared alias)`;
+    case "superseded_invalid_rows":
+      return `note: ${n.source}.${n.column} ${n.rows} invalid row${n.rows === 1 ? "" : "s"} superseded by a later batch`;
+  }
 }
 
 function formatFinding(f: Finding): string {
