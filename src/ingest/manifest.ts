@@ -19,12 +19,22 @@ export const manifestSchema = z
   .object({ batches: z.array(manifestEntrySchema) })
   .superRefine(({ batches }, ctx) => {
     const seen = new Set<string>();
-    batches.forEach(({ tenant, source, batch }, index) => {
+    batches.forEach(({ tenant, source, batch, covers_from, covers_to }, index) => {
       const key = `${tenant}/${source}/${batch}`;
       if (seen.has(key)) {
         ctx.addIssue({ code: "custom", path: ["batches", index], message: `batch ${key} is listed twice` });
       }
       seen.add(key);
+      // An inverted window would never match a day in covers(), so the completeness gate
+      // would withhold nothing for this batch. YYYY-MM-DD compares correctly as a string;
+      // equal dates are a valid one-day window.
+      if (covers_from > covers_to) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["batches", index],
+          message: `batch ${key} covers ${covers_from} to ${covers_to}: covers_from is after covers_to`,
+        });
+      }
     });
   });
 
