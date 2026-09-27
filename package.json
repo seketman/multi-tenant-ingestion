@@ -15,6 +15,7 @@
     "seed": "tsx src/db/seed.ts",
     "load": "tsx src/ingest/loader.ts",
     "test": "vitest run",
+    "check": "tsx src/ingest/check.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
