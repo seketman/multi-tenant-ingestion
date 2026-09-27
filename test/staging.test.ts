@@ -24,6 +24,7 @@ const VIEWS = [
   "staging.ad_spend",
   "staging.refunds",
   "staging.invalid_rows",
+  "staging.current_invalid_rows",
   "marts.daily_revenue",
   "marts.daily_ad_spend",
   "marts.daily_email_engagement",
@@ -198,7 +199,9 @@ describe("staging and marts on the supplied fixtures", () => {
         [lumen],
       );
       expect({ view, leaked: leaked?.n }).toEqual({ view, leaked: 0 });
-      if (view !== "staging.invalid_rows") expect(own?.total).toBeGreaterThan(0);
+      if (view !== "staging.invalid_rows" && view !== "staging.current_invalid_rows") {
+        expect(own?.total).toBeGreaterThan(0);
+      }
     }
   });
 
@@ -323,6 +326,22 @@ describe("a third tenant added by configuration only", () => {
     ]);
   });
 
+  it("keeps an order with an unreadable gross in staging but out of the day's order count", async () => {
+    expect(
+      await query(tenant.id, "SELECT order_id, gross FROM staging.orders WHERE order_id = 'A-3'"),
+    ).toEqual([{ order_id: "A-3", gross: null }]);
+    const [day] = await query<{ staged: number; orders: number }>(
+      tenant.id,
+      `SELECT (SELECT count(*) FROM staging.orders WHERE order_date = '2026-03-01')::int AS staged, orders
+       FROM marts.daily_revenue WHERE day = '2026-03-01'`,
+    );
+    expect(day).toEqual({ staged: 2, orders: 1 });
+    // Nothing restated A-3, so its bad line is still current.
+    expect(
+      await query(tenant.id, "SELECT source, batch_no, line_no, column_name FROM staging.current_invalid_rows"),
+    ).toEqual([{ source: "orders", batch_no: 1, line_no: 4, column_name: "gross" }]);
+  });
+
   it("reads NDJSON lines that use the canonical key and the alias", async () => {
     expect(
       await query(tenant.id, "SELECT event_id, event_type FROM staging.email_events ORDER BY event_id"),
@@ -342,9 +361,10 @@ describe("a third tenant added by configuration only", () => {
       ),
     ).toEqual([
       {
+        // A-3's gross is unreadable, so it is counted in neither orders nor gross.
         day: "2026-03-01",
         currency: "GBP",
-        orders: 2,
+        orders: 1,
         gross: "120.00",
         refunds: "0",
         net: "120.00",

@@ -375,6 +375,65 @@ describe("source health check on synthetic tenants", () => {
     expect(status).toBe(2);
   });
 
+  const ORDERS_HEADER = "order_id,created_at,channel,gross,currency,customer_email\n";
+
+  it("notes an invalid row a later batch corrected instead of reporting it", async () => {
+    const tenant = tenantFor("fixed", ["orders"]);
+    await put(tenant, "orders/batch_01.csv", `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,12.5O,USD,a@example.com\n`);
+    // The source re-sends o-1 with a readable gross: the later batch wins and supersedes the bad line.
+    await put(tenant, "orders/batch_02.csv", `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,12.50,USD,a@example.com\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "orders", 1, "orders/batch_01.csv", "2026-01-11"),
+      entry(tenant, "orders", 2, "orders/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([{ kind: "superseded_invalid_rows", source: "orders", column: "gross", rows: 1 }]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (2/2 batches loaded, as of 2026-01-17)`,
+      "  note: orders.gross 1 invalid row superseded by a later batch",
+    ]);
+    expect(status).toBe(0);
+  });
+
+  it("still reports an invalid row that no later line restated, or that the latest line repeats", async () => {
+    const tenant = tenantFor("stillbad", ["orders"]);
+    await put(
+      tenant,
+      "orders/batch_01.csv",
+      `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,12.5O,USD,a@example.com\n` +
+        "o-2,2026-01-06T00:00:00Z,direct,x,USD,b@example.com\n",
+    );
+    // o-1 is not re-sent; o-2 is re-sent still unreadable, so its batch 2 line is the current one.
+    await put(tenant, "orders/batch_02.csv", `${ORDERS_HEADER}o-2,2026-01-06T00:00:00Z,direct,y,USD,b@example.com\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "orders", 1, "orders/batch_01.csv", "2026-01-11"),
+      entry(tenant, "orders", 2, "orders/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([
+      { kind: "invalid_rows", source: "orders", column: "gross", rows: 2, firstBatch: 1, firstLine: 2 },
+    ]);
+    expect(report.notes).toEqual([{ kind: "superseded_invalid_rows", source: "orders", column: "gross", rows: 1 }]);
+    expect(status).toBe(2);
+  });
+
+  it("reports a row without a natural key as current, since no later line can supersede it", async () => {
+    const tenant = tenantFor("nokey", ["orders"]);
+    await put(tenant, "orders/batch_01.csv", `${ORDERS_HEADER},2026-01-06T00:00:00Z,direct,10.00,USD,a@example.com\n`);
+    await put(tenant, "orders/batch_02.csv", `${ORDERS_HEADER}o-1,2026-01-06T00:00:00Z,direct,10.00,USD,a@example.com\n`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "orders", 1, "orders/batch_01.csv", "2026-01-11"),
+      entry(tenant, "orders", 2, "orders/batch_02.csv", "2026-01-17"),
+    ]);
+    expect(report.findings).toEqual([
+      { kind: "invalid_rows", source: "orders", column: "order_id", rows: 1, firstBatch: 1, firstLine: 2 },
+    ]);
+    expect(report.notes).toEqual([]);
+    expect(status).toBe(2);
+  });
+
   it("reports email event types with no value map entry, which the marts never count", async () => {
     // Lumen's map covers CLICK, OPEN, DELIVERED and UNSUBSCRIBE; BOUNCE has no entry and stays raw.
     const tenant: TenantConfig = { ...tenantFor("unmapped", []), sources: { email_events: lumenSources.email_events } };
