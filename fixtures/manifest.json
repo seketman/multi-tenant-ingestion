@@ -1,0 +1,325 @@
+{
+  "generated_for": "deep_dive",
+  "batches": [
+    {
+      "tenant": "northwind",
+      "source": "orders",
+      "batch": 1,
+      "path": "northwind/orders/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "northwind",
+      "source": "orders",
+      "batch": 2,
+      "path": "northwind/orders/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "northwind",
+      "source": "orders",
+      "batch": 3,
+      "path": "northwind/orders/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "northwind",
+      "source": "orders",
+      "batch": 4,
+      "path": "northwind/orders/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "northwind",
+      "source": "orders",
+      "batch": 5,
+      "path": "northwind/orders/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "northwind",
+      "source": "email_events",
+      "batch": 1,
+      "path": "northwind/email_events/batch_01.ndjson",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "northwind",
+      "source": "email_events",
+      "batch": 2,
+      "path": "northwind/email_events/batch_02.ndjson",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "northwind",
+      "source": "email_events",
+      "batch": 3,
+      "path": "northwind/email_events/batch_03.ndjson",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "northwind",
+      "source": "email_events",
+      "batch": 4,
+      "path": "northwind/email_events/batch_04.ndjson",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "northwind",
+      "source": "email_events",
+      "batch": 5,
+      "path": "northwind/email_events/batch_05.ndjson",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "northwind",
+      "source": "ad_spend",
+      "batch": 1,
+      "path": "northwind/ad_spend/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "northwind",
+      "source": "ad_spend",
+      "batch": 2,
+      "path": "northwind/ad_spend/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "northwind",
+      "source": "ad_spend",
+      "batch": 3,
+      "path": "northwind/ad_spend/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "northwind",
+      "source": "ad_spend",
+      "batch": 4,
+      "path": "northwind/ad_spend/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "northwind",
+      "source": "ad_spend",
+      "batch": 5,
+      "path": "northwind/ad_spend/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "northwind",
+      "source": "refunds",
+      "batch": 1,
+      "path": "northwind/refunds/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "northwind",
+      "source": "refunds",
+      "batch": 2,
+      "path": "northwind/refunds/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "northwind",
+      "source": "refunds",
+      "batch": 3,
+      "path": "northwind/refunds/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "northwind",
+      "source": "refunds",
+      "batch": 4,
+      "path": "northwind/refunds/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "northwind",
+      "source": "refunds",
+      "batch": 5,
+      "path": "northwind/refunds/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "lumen",
+      "source": "orders",
+      "batch": 1,
+      "path": "lumen/orders/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "lumen",
+      "source": "orders",
+      "batch": 2,
+      "path": "lumen/orders/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "lumen",
+      "source": "orders",
+      "batch": 3,
+      "path": "lumen/orders/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "lumen",
+      "source": "orders",
+      "batch": 4,
+      "path": "lumen/orders/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "lumen",
+      "source": "orders",
+      "batch": 5,
+      "path": "lumen/orders/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "lumen",
+      "source": "email_events",
+      "batch": 1,
+      "path": "lumen/email_events/batch_01.ndjson",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "lumen",
+      "source": "email_events",
+      "batch": 2,
+      "path": "lumen/email_events/batch_02.ndjson",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "lumen",
+      "source": "email_events",
+      "batch": 3,
+      "path": "lumen/email_events/batch_03.ndjson",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "lumen",
+      "source": "email_events",
+      "batch": 4,
+      "path": "lumen/email_events/batch_04.ndjson",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "lumen",
+      "source": "email_events",
+      "batch": 5,
+      "path": "lumen/email_events/batch_05.ndjson",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "lumen",
+      "source": "ad_spend",
+      "batch": 1,
+      "path": "lumen/ad_spend/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "lumen",
+      "source": "ad_spend",
+      "batch": 2,
+      "path": "lumen/ad_spend/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "lumen",
+      "source": "ad_spend",
+      "batch": 3,
+      "path": "lumen/ad_spend/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "lumen",
+      "source": "ad_spend",
+      "batch": 4,
+      "path": "lumen/ad_spend/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "lumen",
+      "source": "ad_spend",
+      "batch": 5,
+      "path": "lumen/ad_spend/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    },
+    {
+      "tenant": "lumen",
+      "source": "refunds",
+      "batch": 1,
+      "path": "lumen/refunds/batch_01.csv",
+      "covers_from": "2026-01-06",
+      "covers_to": "2026-01-11"
+    },
+    {
+      "tenant": "lumen",
+      "source": "refunds",
+      "batch": 2,
+      "path": "lumen/refunds/batch_02.csv",
+      "covers_from": "2026-01-12",
+      "covers_to": "2026-01-17"
+    },
+    {
+      "tenant": "lumen",
+      "source": "refunds",
+      "batch": 3,
+      "path": "lumen/refunds/batch_03.csv",
+      "covers_from": "2026-01-18",
+      "covers_to": "2026-01-23"
+    },
+    {
+      "tenant": "lumen",
+      "source": "refunds",
+      "batch": 4,
+      "path": "lumen/refunds/batch_04.csv",
+      "covers_from": "2026-01-24",
+      "covers_to": "2026-01-29"
+    },
+    {
+      "tenant": "lumen",
+      "source": "refunds",
+      "batch": 5,
+      "path": "lumen/refunds/batch_05.csv",
+      "covers_from": "2026-01-30",
+      "covers_to": "2026-02-04"
+    }
+  ]
+}
