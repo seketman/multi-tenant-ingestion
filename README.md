@@ -68,7 +68,7 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 
 | Tool | Version | Source |
 |------|---------|--------|
-| Docker with Compose | any recent | runs `postgres:17` from `docker-compose.yml` on `localhost:54329`; that port must be free |
+| Docker with Compose | any recent | runs `postgres:17` from `docker-compose.yml` on `localhost:54329`, bound to 127.0.0.1 only; that port must be free |
 | Node.js | `^22.18.0` or `>=24.2.0` | `package.json` `engines`; the CLIs use `import.meta.main`, added in Node 22.18.0 and 24.2.0 (not in 23) |
 | pnpm | `11.10.0` | `package.json` `packageManager`; `corepack enable` installs it, or use an installed pnpm |
 
