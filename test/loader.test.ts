@@ -7,7 +7,13 @@ import type { SourceName } from "../src/config/sources.ts";
 import { loadTenants, type TenantConfig } from "../src/config/tenants.ts";
 import { closePools, getOwnerPool, withTenant } from "../src/db/index.ts";
 import { upsertTenant } from "../src/db/seed.ts";
-import { type FileResult, InjectedFailure, type LoadOptions, loadBatches } from "../src/ingest/loader.ts";
+import {
+  type FileResult,
+  INSERT_CHUNK_SIZE,
+  InjectedFailure,
+  type LoadOptions,
+  loadBatches,
+} from "../src/ingest/loader.ts";
 import { loadManifest, type Manifest } from "../src/ingest/manifest.ts";
 import { parseBatchFile } from "../src/ingest/parse.ts";
 
@@ -355,19 +361,18 @@ describe("raw loader on problem files", () => {
   it("rolls back every insert chunk of a large file on a crash and loads it whole on rerun", async () => {
     const tenant = tenantFor("bulk");
     await register(tenant);
-    // 2,500 rows take three INSERT chunks.
-    await put(tenant, "refunds/batch_01.csv", refunds(2_500));
+    // Two and a half chunks' worth of rows take three INSERT chunks, whatever the chunk size.
+    const rows = Math.round(INSERT_CHUNK_SIZE * 2.5);
+    await put(tenant, "refunds/batch_01.csv", refunds(rows));
     const batches = [entry(tenant, "refunds", 1, "refunds/batch_01.csv")];
 
     await expect(load(tenant, batches, { failAfterFiles: 0 })).rejects.toBeInstanceOf(InjectedFailure);
     expect(await ledger(tenant.id)).toEqual([]);
     expect(await rawCount(tenant.id)).toBe(0);
 
-    expect(await load(tenant, batches)).toEqual([expect.objectContaining({ status: "loaded", rowCount: 2_500 })]);
-    expect(await ledger(tenant.id)).toEqual([
-      expect.objectContaining({ status: "loaded", row_count: 2_500, records: 2_500 }),
-    ]);
-    expect(await rawCount(tenant.id)).toBe(2_500);
+    expect(await load(tenant, batches)).toEqual([expect.objectContaining({ status: "loaded", rowCount: rows })]);
+    expect(await ledger(tenant.id)).toEqual([expect.objectContaining({ status: "loaded", row_count: rows, records: rows })]);
+    expect(await rawCount(tenant.id)).toBe(rows);
   });
 
   it("fails a file whose symlink leads out of the tenant's directory, blocks that tenant and loads the others", async () => {
@@ -410,6 +415,49 @@ describe("raw loader on problem files", () => {
     } finally {
       await rm(elsewhere, { recursive: true, force: true });
     }
+  });
+
+  it("loads a file through a symlink that stays inside the tenant's directory", async () => {
+    const tenant = tenantFor("symlink_inside");
+    await register(tenant);
+    const tenantDir = join(root, "fixtures", tenant.id);
+    await put(tenant, "archive/refunds.csv", refunds(3));
+    await mkdir(join(tenantDir, "refunds"), { recursive: true });
+    await symlink(join(tenantDir, "archive/refunds.csv"), join(tenantDir, "refunds/batch_01.csv"));
+
+    expect(await load(tenant, [entry(tenant, "refunds", 1, "refunds/batch_01.csv")])).toEqual([
+      expect.objectContaining({ batch: 1, status: "loaded", rowCount: 3 }),
+    ]);
+    expect(await ledger(tenant.id)).toEqual([expect.objectContaining({ batch_no: 1, status: "loaded", records: 3 })]);
+  });
+
+  it("keeps loading when the onResult observer throws", async () => {
+    const tenant = tenantFor("observer");
+    await register(tenant);
+    await put(tenant, "refunds/batch_01.csv", refunds(1));
+    await put(tenant, "refunds/batch_02.csv", refunds(2));
+
+    let calls = 0;
+    const results = await loadBatches({
+      tenants: [tenant],
+      manifest: {
+        batches: [entry(tenant, "refunds", 1, "refunds/batch_01.csv"), entry(tenant, "refunds", 2, "refunds/batch_02.csv")],
+      },
+      rootDir: root,
+      onResult: () => {
+        calls++;
+        throw new Error("EPIPE");
+      },
+    });
+    expect(calls).toBe(2);
+    expect(results.map((r) => [r.batch, r.status, r.rowCount])).toEqual([
+      [1, "loaded", 1],
+      [2, "loaded", 2],
+    ]);
+    expect(await ledger(tenant.id)).toEqual([
+      expect.objectContaining({ batch_no: 1, status: "loaded", records: 1 }),
+      expect.objectContaining({ batch_no: 2, status: "loaded", records: 2 }),
+    ]);
   });
 
   it("rejects a manifest entry outside the tenant's directory before loading anything", async () => {

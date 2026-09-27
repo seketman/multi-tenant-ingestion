@@ -13,7 +13,7 @@ import type { QuarantineReason } from "./reasons.ts";
 
 const DEFAULT_ROOT_DIR = fileURLToPath(new URL("../../", import.meta.url));
 // Rows per INSERT: keeps each statement's parameters bounded on large files.
-const INSERT_CHUNK_SIZE = 1_000;
+export const INSERT_CHUNK_SIZE = 1_000;
 
 /**
  * - loaded, skipped (same bytes already loaded for this batch), quarantined, missing: the
@@ -165,7 +165,11 @@ export async function loadBatches({
     }
     if (result.status === "loaded") loaded++;
     results.push(result);
-    onResult?.(result);
+    try {
+      onResult?.(result);
+    } catch {
+      // Reporting is best effort: an observer that throws never changes what loads.
+    }
   }
   return results;
 }
@@ -199,7 +203,13 @@ async function loadFile(plan: PlannedFile, pool: pg.Pool, failBeforeCommit: bool
     // through the normal path.
     const { code, constraint } = error as { code?: unknown; constraint?: unknown };
     if (code === "23505" && constraint === "batch_file_loaded_once") {
-      return loadBytes(plan, pool, bytes, sha256, failBeforeCommit);
+      try {
+        return await loadBytes(plan, pool, bytes, sha256, failBeforeCommit);
+      } catch (retryError) {
+        // Reported as the retry's error, keeping the unique violation that caused the retry.
+        if (retryError instanceof Error && retryError.cause === undefined) retryError.cause = error;
+        throw retryError;
+      }
     }
     throw error;
   }
