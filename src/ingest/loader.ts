@@ -34,7 +34,27 @@ export interface FileResult {
   reasons?: QuarantineReason[];
   /** For `failed`: the error message, with its code (and Postgres detail) when it has one. */
   error?: string;
+  /**
+   * For `loaded`: the headers read through a declared alias rather than their canonical
+   * name, in header order. Absent when every header was canonical.
+   */
+  adapted?: HeaderAdaptation[];
 }
+
+/** A raw header that a tenant's declared alias mapped onto a canonical column. */
+export interface HeaderAdaptation {
+  header: string;
+  column: string;
+}
+
+/**
+ * The entries of a file's raw header -> canonical column map (ops.batch_file.detail.columns)
+ * whose header is not the column's own name, i.e. the ones a declared alias resolved.
+ */
+export const headerAdaptations = (columns: Readonly<Record<string, string>>): HeaderAdaptation[] =>
+  Object.entries(columns)
+    .filter(([header, column]) => header !== column)
+    .map(([header, column]) => ({ header, column }));
 
 export interface LoadOptions {
   /** Tenants to load; manifest entries for any other tenant are ignored. */
@@ -285,7 +305,8 @@ async function loadBytes(
       if (failBeforeCommit) {
         throw new InjectedFailure(`injected failure before committing ${entryName(entry)}`);
       }
-      return { ...base, status: "loaded", rowCount: parsed.records.length };
+      const adapted = headerAdaptations(parsed.columns);
+      return { ...base, status: "loaded", rowCount: parsed.records.length, ...(adapted.length > 0 ? { adapted } : {}) };
     },
     pool,
   );
@@ -300,7 +321,10 @@ function failAfterFilesFromEnv(value: string | undefined): number | undefined {
   return Number(value);
 }
 
-/** One line per file for the CLI: status, which batch, and rows or what went wrong. */
+/**
+ * One line per file for the CLI: status, which batch, and rows or what went wrong. A loaded
+ * file read through a declared alias also names each adapted header, so the drift is visible.
+ */
 function formatResult(result: FileResult): string {
   const outcome =
     result.status === "failed"
@@ -311,7 +335,7 @@ function formatResult(result: FileResult): string {
           ? "not attempted after an earlier failure of this tenant"
           : result.status === "missing"
             ? result.path
-            : `${result.rowCount} rows`;
+            : [`${result.rowCount} rows`, ...(result.adapted ?? []).map((a) => `header ${a.header} read as ${a.column}`)].join("; ");
   return `${result.status}: ${entryName(result)}${outcome === undefined ? "" : ` (${outcome})`}`;
 }
 

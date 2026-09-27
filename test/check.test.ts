@@ -108,13 +108,19 @@ describe("source health check on the supplied fixtures", () => {
 
     expect(reportOf(reports, northwind).findings).toEqual([]);
     expect(reportOf(reports, northwind).batches.every((b) => b.status === "loaded")).toBe(true);
+    // Both tenants' later ad_spend files say cost_usd, a declared alias: a note, never a finding.
+    const alias = { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend" };
+    expect(reportOf(reports, lumen).notes).toEqual([{ ...alias, batches: [4, 5] }]);
+    expect(reportOf(reports, northwind).notes).toEqual([{ ...alias, batches: [4, 5] }]);
     expect(exitStatus(reports)).toBe(2);
     expect(exitStatus([reportOf(reports, northwind)])).toBe(0);
 
     expect(formatReport(reports)).toEqual([
       `lumen_${suffix}: 1 finding (19/20 batches loaded, as of 2026-02-04)`,
       `  not_received: ad_spend/batch 3 (lumen/ad_spend/batch_03.csv, covers through 2026-01-23)`,
+      `  note: ad_spend batches 4-5 read header "cost_usd" as spend (declared alias)`,
       `northwind_${suffix}: healthy (20/20 batches loaded, as of 2026-02-04)`,
+      `  note: ad_spend batches 4-5 read header "cost_usd" as spend (declared alias)`,
     ]);
   });
 
@@ -141,6 +147,7 @@ describe("source health check on the supplied fixtures", () => {
     expect(report?.batches).toHaveLength(batches.length);
     expect(report?.batches.every((b) => b.status === "not_received")).toBe(true);
     expect(Object.values(report?.freshness ?? {}).every((d) => d === null)).toBe(true);
+    expect(report?.notes).toEqual([]);
 
     // And the loaded tenant's report only covers its own manifest entries.
     const [own] = await checkSources({ tenants: [reportTenant(tenants, northwind)], manifest: both });
@@ -217,6 +224,31 @@ describe("source health check on synthetic tenants", () => {
       { kind: "stale", source: "ad_spend", freshThrough: "2026-01-11", asOf: "2026-01-17" },
     ]);
     expect(status).toBe(2);
+  });
+
+  it("notes headers read through a declared alias without counting them as findings", async () => {
+    const tenant = tenantFor("alias", ["ad_spend"]);
+    const row = (day: string) => `${day},c-1,facebook,1.00\n`;
+    await put(tenant, "ad_spend/batch_01.csv", `date,campaign_id,platform,cost_usd\n${row("2026-01-06")}`);
+    await put(tenant, "ad_spend/batch_02.csv", `date,campaign_id,platform,spend\n${row("2026-01-07")}`);
+    await put(tenant, "ad_spend/batch_03.csv", `date,campaign_id,platform,cost_usd\n${row("2026-01-08")}`);
+    await put(tenant, "ad_spend/batch_04.csv", `date,campaign_id,platform,cost_usd\n${row("2026-01-09")}`);
+
+    const { report, status } = await loadAndCheck(tenant, [
+      entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-06"),
+      entry(tenant, "ad_spend", 2, "ad_spend/batch_02.csv", "2026-01-07"),
+      entry(tenant, "ad_spend", 3, "ad_spend/batch_03.csv", "2026-01-08"),
+      entry(tenant, "ad_spend", 4, "ad_spend/batch_04.csv", "2026-01-09"),
+    ]);
+    expect(report.findings).toEqual([]);
+    expect(report.notes).toEqual([
+      { kind: "declared_alias", source: "ad_spend", header: "cost_usd", column: "spend", batches: [1, 3, 4] },
+    ]);
+    expect(formatReport([report])).toEqual([
+      `${tenant.id}: healthy (4/4 batches loaded, as of 2026-01-09)`,
+      '  note: ad_spend batches 1, 3-4 read header "cost_usd" as spend (declared alias)',
+    ]);
+    expect(status).toBe(0);
   });
 
   it("reports a latest batch that was never delivered as not received and the source as stale", async () => {

@@ -138,6 +138,12 @@ describe("raw loader on the supplied fixtures", () => {
       expect(replay.filter((r) => r.status === "missing").map((r) => [r.tenant, r.source, r.batch])).toEqual([
         [`lumen_${suffix}`, "ad_spend", 3],
       ]);
+      // Northwind's ad_spend batch 4 says cost_usd, its declared alias for spend; batch 1 is canonical.
+      const northwindAd = (batch: number) =>
+        replay.find((r) => r.tenant === `northwind_${suffix}` && r.source === "ad_spend" && r.batch === batch);
+      expect(northwindAd(4)).toMatchObject({ status: "loaded", adapted: [{ header: "cost_usd", column: "spend" }] });
+      expect(northwindAd(1)?.status).toBe("loaded");
+      expect(northwindAd(1)).not.toHaveProperty("adapted");
 
       const afterReplay = await loadedRows();
       expect(afterReplay.every((r) => r.status === "loaded")).toBe(true);

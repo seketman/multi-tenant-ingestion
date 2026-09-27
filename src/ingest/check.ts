@@ -4,7 +4,7 @@ import { type ClosedColumn, canonicalValues, SOURCE_COLUMNS, SOURCE_NAMES, type 
 import { loadTenants, type TenantConfig } from "../config/tenants.ts";
 import { closePools, getAppPool } from "../db/pool.ts";
 import { withTenant } from "../db/tenant-scope.ts";
-import { describeError } from "./loader.ts";
+import { describeError, headerAdaptations } from "./loader.ts";
 import { loadManifest, type Manifest, type ManifestEntry, manifestSchema } from "./manifest.ts";
 
 const DEFAULT_MANIFEST = fileURLToPath(new URL("../../fixtures/manifest.json", import.meta.url));
@@ -57,6 +57,14 @@ export type Finding =
       values: { value: string; rows: number }[];
     };
 
+/**
+ * Something worth knowing that is not a problem, so it never changes the exit status:
+ * - declared_alias: loaded batches that read a header through an alias the tenant declared
+ *   (ops.batch_file.detail.columns), e.g. `cost_usd` read as `spend`. The drift is expected,
+ *   but it stays visible. `batches` are ascending batch numbers of that source.
+ */
+export type Note = { kind: "declared_alias"; source: SourceName; header: string; column: string; batches: number[] };
+
 export interface TenantHealth {
   tenant: string;
   asOf: string;
@@ -64,6 +72,7 @@ export interface TenantHealth {
   /** Latest covers_to among loaded batches, per configured source; null when none is loaded. */
   freshness: Partial<Record<SourceName, string | null>>;
   findings: Finding[];
+  notes: Note[];
 }
 
 export interface CheckOptions {
@@ -85,7 +94,7 @@ interface LedgerRow {
   source: SourceName;
   batch_no: number;
   status: "loaded" | "quarantined";
-  detail: { reasons?: { code: string }[] } | null;
+  detail: { reasons?: { code: string }[]; columns?: Record<string, string> } | null;
 }
 
 interface InvalidRowsRow {
@@ -152,6 +161,7 @@ async function stagingFindings(client: pg.PoolClient): Promise<Finding[]> {
  * Compares each tenant's manifest with its ledger (ops.batch_file), read inside that
  * tenant's scope, so row-level security keeps one tenant's rows out of another's report.
  * In the same scope it reads staging for data-quality findings (invalid_rows, uncounted_values).
+ * The ledger's loaded rows also yield notes on headers read through declared aliases.
  * Read-only. Without `pool`, the shared application pool is used and the caller must
  * call `closePools()` when done, as the CLI below does.
  */
@@ -236,7 +246,39 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
     if (!configured.includes(source)) findings.push({ kind: "source_not_configured", source });
   }
 
-  return { tenant: tenant.id, asOf, batches, freshness, findings };
+  return { tenant: tenant.id, asOf, batches, freshness, findings, notes: aliasNotes(ledger) };
+}
+
+/**
+ * One declared_alias note per source, header and column, from the column maps of loaded
+ * ledger rows. Read from the ledger rather than the manifest, so a batch that never loaded
+ * is left out of the batch list. Sources in SOURCE_NAMES order, headers as first seen.
+ */
+function aliasNotes(ledger: LedgerRow[]): Note[] {
+  const notes = new Map<string, Note>();
+  for (const row of ledger) {
+    if (row.status !== "loaded") continue;
+    for (const { header, column } of headerAdaptations(row.detail?.columns ?? {})) {
+      const key = JSON.stringify([row.source, header, column]);
+      const note = notes.get(key) ?? { kind: "declared_alias", source: row.source, header, column, batches: [] };
+      if (!note.batches.includes(row.batch_no)) note.batches.push(row.batch_no);
+      notes.set(key, note);
+    }
+  }
+  for (const note of notes.values()) note.batches.sort((a, b) => a - b);
+  return [...notes.values()].sort((a, b) => SOURCE_NAMES.indexOf(a.source) - SOURCE_NAMES.indexOf(b.source));
+}
+
+/** Ascending batch numbers as runs, e.g. [1, 3, 4, 5] -> "batches 1, 3-5", [4] -> "batch 4". */
+function batchRanges(batches: number[]): string {
+  const runs: [number, number][] = [];
+  for (const batch of batches) {
+    const last = runs.at(-1);
+    if (last !== undefined && batch === last[1] + 1) last[1] = batch;
+    else runs.push([batch, batch]);
+  }
+  const text = runs.map(([first, end]) => (first === end ? `${first}` : `${first}-${end}`)).join(", ");
+  return `${batches.length === 1 ? "batch" : "batches"} ${text}`;
 }
 
 /**
@@ -247,8 +289,13 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
  *   stale or unlisted source, invalid rows or values the marts do not count).
  * - 1 (set by the CLI, never returned here): the check itself failed, e.g. a bad
  *   manifest or an unreachable database, so nothing is known about the data.
+ * Notes (e.g. a declared alias in use) are expected drift and never affect it.
  */
 export const exitStatus = (reports: TenantHealth[]): 0 | 2 => (reports.some((r) => r.findings.length > 0) ? 2 : 0);
+
+function formatNote(n: Note): string {
+  return `note: ${n.source} ${batchRanges(n.batches)} read header "${n.header}" as ${n.column} (declared alias)`;
+}
 
 function formatFinding(f: Finding): string {
   switch (f.kind) {
@@ -273,7 +320,10 @@ function formatFinding(f: Finding): string {
   }
 }
 
-/** A summary line per tenant, followed by one indented line per finding. */
+/**
+ * A summary line per tenant, followed by one indented line per finding and then one per
+ * note. Notes are not findings, so the summary's count and "healthy" leave them out.
+ */
 export function formatReport(reports: TenantHealth[]): string[] {
   return reports.flatMap((r) => {
     const loaded = r.batches.filter((b) => b.status === "loaded").length;
@@ -281,6 +331,7 @@ export function formatReport(reports: TenantHealth[]): string[] {
     return [
       `${r.tenant}: ${state} (${loaded}/${r.batches.length} batches loaded, as of ${r.asOf || "n/a"})`,
       ...r.findings.map((f) => `  ${formatFinding(f)}`),
+      ...r.notes.map((n) => `  ${formatNote(n)}`),
     ];
   });
 }
