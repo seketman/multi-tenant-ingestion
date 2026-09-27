@@ -236,6 +236,35 @@ describe("source health check on synthetic tenants", () => {
     expect(status).toBe(2);
   });
 
+  it("reports a loaded batch whose later redelivery with other content was quarantined", async () => {
+    const tenant = tenantFor("redeliver", ["ad_spend"]);
+    const header = "date,campaign_id,platform,cost_usd\n";
+    await put(tenant, "ad_spend/batch_01.csv", `${header}2026-01-06,c-1,facebook,1.00\n`);
+    const batches = [entry(tenant, "ad_spend", 1, "ad_spend/batch_01.csv", "2026-01-11")];
+    const first = await loadAndCheck(tenant, batches);
+    expect(first.report.findings).toEqual([]);
+    expect(first.status).toBe(0);
+
+    // The source re-sends batch 1 with a corrected amount: the loader holds it back.
+    await put(tenant, "ad_spend/batch_01.csv", `${header}2026-01-06,c-1,facebook,2.00\n`);
+    const { report, status } = await loadAndCheck(tenant, batches);
+    expect(report.batches.map((b) => [b.batch, b.status])).toEqual([[1, "loaded"]]);
+    expect(report.findings).toEqual([
+      {
+        kind: "conflicting_redelivery",
+        source: "ad_spend",
+        batch: 1,
+        path: `${tenant.id}/ad_spend/batch_01.csv`,
+        coversTo: "2026-01-11",
+        reasonCodes: ["batch_conflict"],
+      },
+    ]);
+    expect(formatReport([report])[1]).toBe(
+      "  conflicting_redelivery: ad_spend/batch 1 is loaded, but a later delivery with different content was quarantined (batch_conflict)",
+    );
+    expect(status).toBe(2);
+  });
+
   it("flags a configured source with no manifest entries and a listed source that is not configured", async () => {
     const tenant = tenantFor("mismatch", ["refunds", "orders"]);
     await put(tenant, "refunds/batch_01.csv", "refund_id,refunded_at,order_id,amount,currency\nrf-1,2026-01-06T00:00:00Z,o-1,1.00,USD\n");

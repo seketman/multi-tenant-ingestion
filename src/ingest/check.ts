@@ -27,6 +27,9 @@ export interface BatchHealth {
  * Something a scheduler should alert on:
  * - not_received: a manifest batch with no ledger row at all (never arrived, or never loaded).
  * - quarantined: attempted, never loaded.
+ * - conflicting_redelivery: loaded, but a later attempt delivered different bytes for the
+ *   same batch and was quarantined (batch_conflict). The loaded numbers may be superseded
+ *   by data nobody has loaded yet, so the replaced batch must not look healthy.
  * - stale: a configured source whose loaded data ends before `asOf` (`freshThrough` null: nothing loaded).
  * - no_manifest_entries: a configured source the manifest lists no batch for.
  * - source_not_configured: the manifest lists batches for a source the tenant has not configured.
@@ -34,6 +37,7 @@ export interface BatchHealth {
 export type Finding =
   | ({ kind: "not_received" } & Omit<BatchHealth, "status" | "reasonCodes">)
   | ({ kind: "quarantined"; reasonCodes: string[] } & Omit<BatchHealth, "status" | "reasonCodes">)
+  | ({ kind: "conflicting_redelivery"; reasonCodes: string[] } & Omit<BatchHealth, "status" | "reasonCodes">)
   | { kind: "stale"; source: SourceName; freshThrough: string | null; asOf: string }
   | { kind: "no_manifest_entries"; source: SourceName }
   | { kind: "source_not_configured"; source: SourceName };
@@ -107,6 +111,8 @@ export async function checkSources({
 
 const latest = (dates: string[]): string | null => dates.reduce<string | null>((a, d) => (a === null || d > a ? d : a), null);
 
+const codesOf = (row: LedgerRow): string[] => [...new Set((row.detail?.reasons ?? []).map((r) => r.code))];
+
 function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRow[], asOfOption?: string): TenantHealth {
   const asOf = asOfOption ?? latest(entries.map((e) => e.covers_to)) ?? "";
   const findings: Finding[] = [];
@@ -114,13 +120,22 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
   const batches = entries.map((entry): BatchHealth => {
     const attempts = ledger.filter((r) => r.source === entry.source && r.batch_no === entry.batch);
     const base = { source: entry.source, batch: entry.batch, path: entry.path, coversTo: entry.covers_to };
-    if (attempts.some((r) => r.status === "loaded")) return { ...base, status: "loaded" };
+    const loadedAt = attempts.findIndex((r) => r.status === "loaded");
+    if (loadedAt !== -1) {
+      // Ledger rows are in attempt order (by id), so these came after the load.
+      const conflict = attempts
+        .slice(loadedAt + 1)
+        .filter((r) => r.status === "quarantined" && codesOf(r).includes("batch_conflict"))
+        .at(-1);
+      if (conflict !== undefined) findings.push({ kind: "conflicting_redelivery", ...base, reasonCodes: codesOf(conflict) });
+      return { ...base, status: "loaded" };
+    }
     const last = attempts.at(-1);
     if (last === undefined) {
       findings.push({ kind: "not_received", ...base });
       return { ...base, status: "not_received" };
     }
-    const reasonCodes = [...new Set((last.detail?.reasons ?? []).map((r) => r.code))];
+    const reasonCodes = codesOf(last);
     findings.push({ kind: "quarantined", ...base, reasonCodes });
     return { ...base, status: "quarantined", reasonCodes };
   });
@@ -147,7 +162,8 @@ function assess(tenant: TenantConfig, entries: ManifestEntry[], ledger: LedgerRo
 /**
  * The process exit code for a run, which is what a scheduler alerts on:
  * - 0: every manifest batch is loaded and every configured source is current.
- * - 2: findings (a batch not received or quarantined, a stale or unlisted source).
+ * - 2: findings (a batch not received, quarantined or redelivered with other content, a
+ *   stale or unlisted source).
  * - 1 (set by the CLI, never returned here): the check itself failed, e.g. a bad
  *   manifest or an unreachable database, so nothing is known about the data.
  */
@@ -159,6 +175,8 @@ function formatFinding(f: Finding): string {
       return `not_received: ${f.source}/batch ${f.batch} (${f.path}, covers through ${f.coversTo})`;
     case "quarantined":
       return `quarantined: ${f.source}/batch ${f.batch} (${f.reasonCodes.join(", ") || "no reasons recorded"})`;
+    case "conflicting_redelivery":
+      return `conflicting_redelivery: ${f.source}/batch ${f.batch} is loaded, but a later delivery with different content was quarantined (${f.reasonCodes.join(", ")})`;
     case "stale":
       return `stale: ${f.source} loaded through ${f.freshThrough ?? "nothing"}, expected ${f.asOf}`;
     case "no_manifest_entries":
