@@ -16,6 +16,7 @@
     "load": "tsx src/ingest/loader.ts",
     "test": "vitest run",
     "check": "tsx src/ingest/check.ts",
+    "tenant:validate": "tsx src/onboarding/validate.ts",
     "report": "tsx src/report/publish.ts",
     "typecheck": "tsc --noEmit"
   },

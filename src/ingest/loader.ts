@@ -93,7 +93,7 @@ const compareEntries = (a: ManifestEntry, b: ManifestEntry): number =>
   compareText(a.tenant, b.tenant) || compareText(a.source, b.source) || a.batch - b.batch;
 
 /** True when `path` is strictly below `dir`. Both must be absolute. */
-const isInside = (dir: string, path: string): boolean => {
+export const isInside = (dir: string, path: string): boolean => {
   const rel = relative(dir, path);
   return rel !== "" && !isAbsolute(rel) && rel.split(sep)[0] !== "..";
 };
