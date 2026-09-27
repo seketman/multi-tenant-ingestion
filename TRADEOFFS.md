@@ -94,6 +94,22 @@ Why restate and keep an audit trail rather than the alternatives. Posting the ch
 - Value maps are tenant data (`ops.value_map`), not code. No SQL or TypeScript branches on a tenant name.
 - Tests prove that an unscoped connection sees zero rows through every table and view, that a scoped tenant never sees another's rows, and that writes for another tenant are rejected (`test/isolation.test.ts`, `test/staging.test.ts`).
 
+### Who uses what
+
+| Actor | What it does | Tenants it acts for |
+|-------|--------------|---------------------|
+| The pipeline (`pnpm load`, `check`, `report`) | Ingests, checks and publishes, as the app role | All of them: one service serves every tenant |
+| The operator (data team) | Runs the pipeline and acts on `pnpm check` | All of them |
+| Whoever onboards a client | Writes `tenants/<id>.json`, the fixtures and manifest entries | The new one |
+| The client (the brand) | Consumes its numbers, which is who the marts and `marts.reported_metric` are for | Only its own |
+
+RLS guarantees that every query is scoped and that a scoped session cannot read or write another tenant's rows. It does not decide who may choose the scope: whoever can connect as the app role can set any `app.tenant_id`. That is acceptable only because the app role is used by the pipeline, which serves every tenant by design and derives the tenant of each file from the manifest and tenant config, with manifest paths checked against the tenant's `fixturesDir`.
+
+So clients must never connect as the app role. Client access is not built here; the brief asks for the ingestion and modelling layer. It needs one of two designs:
+
+- A database role per client, with policies bound to the login identity (`current_user`) rather than to a setting the client could change.
+- An access layer (an API or a BI tool) that derives the tenant from the authenticated identity, never from a parameter the client sends.
+
 ## What I deliberately did not build and why
 
 | Not built | Why |
@@ -115,7 +131,7 @@ These are built far enough to work on the fixtures, but each has a hole I know a
 | A missing value-map entry is caught only after loading | Config validation rejects a non-canonical target for `email_events.type` (`value map target "opened" for email_events.type is not one of delivered, open, click, unsubscribe`), but it cannot know which raw values a file will carry. A missing entry shows up as `uncounted_values` in `pnpm check`. `channel` and `platform` are open on purpose, so a new channel stays configuration only, and a typo there becomes a channel of its own without a finding. | Config alone cannot: for `email_events.type`, `pnpm check` is the guard. For open columns, a finding for a value seen for the first time. |
 | `invalid_rows` counts superseded lines | The finding counts every line in `staging.invalid_rows`, including lines a later batch replaced, so a corrected bad row keeps `pnpm check` at exit 2. | Count only lines that survive de-duplication. |
 | A failed cast still counts in `orders` | If an order's `gross` fails its cast, the order is counted in `orders` with gross `NULL` and left out of the sums (the supplied fixtures have no such row). `pnpm check` now reports it as `invalid_rows`, but the mart still counts the order. | Leave rows whose `gross` failed its cast out of `orders`. |
-| Isolation trusts the application to pick the tenant | The database blocks unscoped and cross-tenant queries, but any application session can set any `app.tenant_id`. | Per-tenant roles (one pool or `SET ROLE` per tenant), or a `SECURITY DEFINER` entry point that every query goes through. Both add moving parts, which is why I stopped at the database guard. |
+| The pipeline chooses the tenant it acts for | The database blocks unscoped and cross-tenant queries, but any session of the app role can set any `app.tenant_id`. That is the trust boundary of a single service that serves every tenant (see [Who uses what](#who-uses-what)), not a hole in the policies. | Per-tenant credentials held by separate per-tenant workers, so one tenant's worker cannot authenticate as another's. `SET ROLE` per tenant from one shared login would not close it, because that login could still switch to any tenant. It is a deployment change (workers, secrets), which is why I stopped at the database guard. |
 | A value-map change restates history without a cause | Editing a value map changes staging, so the next `pnpm report` restates past days with an empty `caused_by`: the change came from config, not from a file. | Record config versions per report run and cite them in `caused_by`. |
 | "Orphan" also means "not arrived yet" | A refund whose order is in a later batch counts as an orphan until that batch loads (see [Late arrivals](#late-arrivals)). | Report refunds for unknown orders as pending until the order's window has been checked as complete. |
 
