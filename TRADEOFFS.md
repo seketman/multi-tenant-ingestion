@@ -1,6 +1,6 @@
 # Tradeoffs
 
-Short version: the loading path (replay, drift, isolation) is built deep and tested against a real database (over 100 tests). Modelling, late arrivals and missing-source detection are built on top of it and tested, with the known gaps listed [below](#known-gaps). Currency conversion, scheduling and large-file streaming are not built, on purpose.
+Short version: the loading path (replay, drift, isolation) is built deep and tested against a real database (over 120 tests). Modelling, late arrivals and missing-source detection are built on top of it and tested, with the known gaps listed [below](#known-gaps). Currency conversion, scheduling and large-file streaming are not built, on purpose.
 
 Built with AI assistance under my direction. Every change went through adversarial review lenses (risk, reliability, resilience) before commit. The history is committed as work units, each with its tests (`git log`).
 
@@ -44,11 +44,15 @@ Only drift the config declares is adapted. Both tenants' `ad_spend` column `spen
 
 Noticing drift is structural, not a heuristic. Every header must resolve to exactly one canonical column and every canonical column must be present, so an unexpected change cannot pass silently. The resolved header map is stored per file in the ledger (`detail.columns`), and staging reads columns through it. A later alias change therefore never reinterprets a file that is already loaded.
 
+Declared drift is adapted, but not silently: `pnpm load` names each header read through an alias (`loaded: lumen/ad_spend/batch 4 (18 rows; header cost_usd read as spend)`), and `pnpm check` prints a note from the ledger (`note: ad_spend batches 4-5 read header "cost_usd" as spend (declared alias)`). Notes never change the exit code, because the drift is expected.
+
 ### Missing sources
 
-`pnpm check` compares each tenant's manifest with its ledger and reports `not_received`, `quarantined` and `stale` batches, a loaded batch whose later redelivery with other content was quarantined (`conflicting_redelivery`), and mismatches between config and manifest (`no_manifest_entries`, `source_not_configured`). Exit codes are 0 healthy, 2 findings, 1 check failed, so a scheduler can alert on them.
+`pnpm check` compares each tenant's manifest with its ledger and reports `not_received`, `quarantined` and `stale` batches, a loaded batch whose later redelivery with other content was quarantined (`conflicting_redelivery`), and mismatches between config and manifest (`no_manifest_entries`, `source_not_configured`). It also reads staging for two data-quality findings: `invalid_rows` (values that are missing or fail their cast) and `uncounted_values` (event types outside `delivered`, `open`, `click`, `unsubscribe`, which the marts never count). Exit codes are 0 healthy, 2 findings, 1 check failed, so a scheduler can alert on them.
 
 Lumen's `ad_spend` batch 3 is listed in the manifest and absent from the fixtures, and the check reports it. A freshness check alone would miss it, because batches 4 and 5 loaded and the source looks current.
+
+`pnpm report` uses the same comparison as a completeness gate (`src/ingest/coverage.ts`): it withholds a mart key whose day falls inside the window of a manifest batch with no loaded ledger row (not received, or only quarantined), for a source in that mart's lineage. For lumen that is `daily_channel_performance` for 2026-01-18 to 2026-01-23, 24 keys, which would otherwise have been published with spend 0 and ROAS `NULL`. Revenue and email engagement for those days do not depend on `ad_spend` and are published. Each run records the windows and keys it held back in `ops.report_run.withheld` (`migrations/010_report_run_withheld.sql`).
 
 ### Late arrivals
 
@@ -59,10 +63,12 @@ The marts are live views over everything loaded, so a late file changes them sil
 - `caused_by` is the loaded files feeding that day now that the previous version's run had not seen (`ops.report_run` records which files each run saw). When a change comes only from rows leaving a day, it falls back to every newer file of the mart's sources, which is approximate; the JSDoc says so.
 - Metrics are compared as exact numeric strings. One transaction per tenant, under a per-tenant advisory lock, so a publication is complete or absent. The tables are append-only for the application role: `SELECT` and `INSERT` only.
 
-Evidence from the fixtures (`test/report.test.ts`: batches 1-4, publish, batch 5, publish):
+Withholding and restating answer different questions. A restatement corrects a number that was complete when it was published and changed because a late record arrived. A withheld key is one whose data is known to be incomplete right now, because a batch covering its day has not loaded. Publishing it and restating it later would tell the client a wrong number first, such as no ad spend, so it gets no version, no restatement and no tombstone until the batch loads, and then is published as usual: version 1 if it was never published, a restatement if its numbers moved. The gate cannot undo a number published before its window became incomplete; that version stays the latest until the batch loads (see [Known gaps](#known-gaps)).
+
+Evidence from the fixtures (`test/report.test.ts`: batches 1-4, publish, batch 5, publish; each report is given the manifest of what had been delivered by then):
 
 - Northwind: 18 restatements. Six are `daily_email_engagement` for exactly 2026-01-12 to 2026-01-17, all caused by `email_events/batch_05.ndjson`, which carries 24 events for days batch 2 already covered. For example, 2026-01-13 opens went from 18 to 20, clicks from 10 to 11, unsubscribes from 15 to 16. The other 12 are `daily_revenue`.
-- Lumen: 7 restatements, all `daily_revenue`.
+- Lumen: 7 restatements, all `daily_revenue`. Its 24 `daily_channel_performance` keys for 2026-01-18 to 2026-01-23 are withheld in both runs, because `ad_spend` batch 3 never arrives.
 - Days batch 5 did not touch are never restated.
 
 The revenue restatements follow from how refunds are dated. `daily_revenue` puts a refund on the day it was refunded (cash basis), and a refunds batch is not limited to its window: lumen's `refunds/batch_05.csv` covers 2026-01-30 to 02-04 but carries refunds dated January 9, 10, 11 and 28. Earlier refund files also carry refunds dated after their window, for orders that only arrive in orders batch 5; until then those refunds have no order and count as orphans. I derived the breakdown from the fixture files with a read-only script (same de-duplication and orphan rule as the views), and it matches the test's counts:
@@ -105,10 +111,10 @@ These are built far enough to work on the fixtures, but each has a hole I know a
 
 | Gap | What happens today | What would close it |
 |-----|--------------------|---------------------|
-| A batch that never arrived is published as real numbers | Lumen's `ad_spend` batch 3 is missing, so its channel performance for January 18 to 23 shows spend 0 and ROAS `NULL`. `pnpm check` exits 2, but nothing stops `pnpm report`. | Store `covers_from` and `covers_to` in the ledger, and have `pnpm report` withhold or flag days that overlap a `not_received` or quarantined window. |
-| Value maps are not validated | A typo in a target (`"Opened": "opened"`) or a missing entry passes the value through, and it is simply not counted. `staging.invalid_rows` exists but no command reports it. | Validate value-map targets against the canonical values in the config schema, and have `pnpm check` report unmapped values and invalid-row counts. |
-| A failed cast still counts | An order whose `gross` fails its cast is counted in `orders` with gross `NULL`, and is listed in `staging.invalid_rows`. Nothing alerts. | The same `pnpm check` report of invalid rows. |
-| Declared drift is adapted silently | The `cost_usd` alias is applied at load time and the ledger stores the column map, but neither `pnpm load` nor `pnpm check` says "adapted via alias". | Print and report files loaded through an alias. |
+| A number published before its window became incomplete stays visible | `pnpm report` withholds keys inside the window of a batch that has not loaded, but it cannot take back a version published earlier: that version stays the latest until the batch loads. The gate also reads the manifest (`fixtures/manifest.json` or `MANIFEST=`), so a tenant absent from it gets no withholding, and the ledger does not record what a loaded batch covered. | A "retract" or "incomplete" marker version for a key whose window became incomplete, and `covers_from` and `covers_to` stored in the ledger. |
+| A missing value-map entry is caught only after loading | Config validation rejects a non-canonical target for `email_events.type` (`value map target "opened" for email_events.type is not one of delivered, open, click, unsubscribe`), but it cannot know which raw values a file will carry. A missing entry shows up as `uncounted_values` in `pnpm check`. `channel` and `platform` are open on purpose, so a new channel stays configuration only, and a typo there becomes a channel of its own without a finding. | Config alone cannot: for `email_events.type`, `pnpm check` is the guard. For open columns, a finding for a value seen for the first time. |
+| `invalid_rows` counts superseded lines | The finding counts every line in `staging.invalid_rows`, including lines a later batch replaced, so a corrected bad row keeps `pnpm check` at exit 2. | Count only lines that survive de-duplication. |
+| A failed cast still counts in `orders` | If an order's `gross` fails its cast, the order is counted in `orders` with gross `NULL` and left out of the sums (the supplied fixtures have no such row). `pnpm check` now reports it as `invalid_rows`, but the mart still counts the order. | Leave rows whose `gross` failed its cast out of `orders`. |
 | Isolation trusts the application to pick the tenant | The database blocks unscoped and cross-tenant queries, but any application session can set any `app.tenant_id`. | Per-tenant roles (one pool or `SET ROLE` per tenant), or a `SECURITY DEFINER` entry point that every query goes through. Both add moving parts, which is why I stopped at the database guard. |
 | A value-map change restates history without a cause | Editing a value map changes staging, so the next `pnpm report` restates past days with an empty `caused_by`: the change came from config, not from a file. | Record config versions per report run and cite them in `caused_by`. |
 | "Orphan" also means "not arrived yet" | A refund whose order is in a later batch counts as an orphan until that batch loads (see [Late arrivals](#late-arrivals)). | Report refunds for unknown orders as pending until the order's window has been checked as complete. |
@@ -125,12 +131,12 @@ The test "a third tenant added by configuration only" in `test/staging.test.ts` 
 
 ## What I would do with another week
 
-In rough priority order:
+The first items on the earlier version of this list are built, with the gaps above still open: the completeness gate on publishing, value-map target validation with the `invalid_rows` and `uncounted_values` findings, and reporting of headers read through a declared alias. What remains, in rough priority order:
 
-1. A completeness gate on publishing: store `covers_from` and `covers_to` in the ledger, and have `pnpm report` withhold or flag days that overlap a `not_received` or quarantined window. That stops lumen's missing ad spend from being published as zero, and the check would no longer depend on the current manifest to know what a loaded batch covered. (Publishing only "fresh" days, which I had planned first, would hold back the refund-only days at the end of the window, but not the late refunds for days weeks back. Those are exactly what restatements are for.)
-2. Validate value-map targets against the canonical values in the config schema, and have `pnpm check` report unmapped values and `staging.invalid_rows` counts, so a new channel, a typo or a failed cast is visible instead of silently uncounted.
-3. An operator flow that accepts a `batch_conflict` as a restatement of a whole batch, which today stays in quarantine and is flagged as `conflicting_redelivery`.
-4. Report files loaded through a declared alias, and cite config changes in `caused_by`.
+1. Close the completeness gate's remaining hole: a "retract" or "incomplete" marker for a key published before its window became incomplete, and `covers_from` and `covers_to` stored in the ledger, so the gate and the check no longer depend on the current manifest to know what a loaded batch covered. (Publishing only "fresh" days, which I had planned first, would hold back the refund-only days at the end of the window, but not the late refunds for days weeks back. Those are exactly what restatements are for.)
+2. An operator flow that accepts a `batch_conflict` as a restatement of a whole batch, which today stays in quarantine and is flagged as `conflicting_redelivery`.
+3. Cite config changes in `caused_by`.
+4. Count only current lines in the `invalid_rows` finding, so a corrected bad row clears it.
 5. Stream large files instead of buffering them whole.
 6. Set `lock_timeout` and TCP keepalive on the pools, add `'error'` listeners on pooled clients, and handle `EPIPE` on stdout in the CLIs.
 7. `ALTER DEFAULT PRIVILEGES` so future views get their grants without a migration having to remember.

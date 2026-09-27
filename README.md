@@ -5,8 +5,8 @@ Loads batch exports from several clients (tenants) into one Postgres database an
 - Every tenant's rows are invisible to every other tenant, enforced by the database, not by the application.
 - Each batch file is loaded at most once, in one transaction, and recorded in a ledger with its sha256, so a crashed or repeated run is safe to rerun.
 - Files that do not match the tenant's declared shape are quarantined with reasons instead of being half-loaded.
-- A health check compares what the manifest says should have arrived with what the ledger says did.
-- A report run publishes the daily numbers as versions. When a late file changes a number a client was already told, it records a restatement instead of changing it silently.
+- A health check compares what the manifest says should have arrived with what the ledger says did, and reports rows the marts cannot count.
+- A report run publishes the daily numbers as versions. It withholds a day whose source data never arrived. When a late file changes a number a client was already told, it records a restatement instead of changing it silently.
 
 ```text
 fixtures/<tenant>/<source>/batch_NN.*        what the client sent
@@ -37,11 +37,11 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 |------|-------|-----------------------------|
 | Idempotent loading, crash and replay | Done in depth | `src/ingest/loader.ts`, `test/loader.test.ts` |
 | Tenant isolation (forced RLS, non-superuser owner, app role owns nothing) | Done in depth | `migrations/001`-`005`, `test/isolation.test.ts`, `test/staging.test.ts`. Gap: any app session can choose any `app.tenant_id`; the application is trusted to pass the right one |
-| Schema drift: declared aliases, whole-file quarantine otherwise | Built, with known gaps | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts`. Gap: a declared alias is adapted silently; no command reports it |
-| Staging and daily marts | Built, with known gaps | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts`. Gap: unmapped values are silently uncounted, and a row with a failed cast still counts in `orders` but is left out of the sums, without an alert |
-| Missing-source detection | Built, with known gaps | `src/ingest/check.ts`, `test/check.test.ts`. Gap: `pnpm check` finds the missing batch, but nothing stops `pnpm report` from publishing those days as real numbers |
+| Schema drift: declared aliases, whole-file quarantine otherwise | Built | `src/ingest/headers.ts`, `src/ingest/parse.ts`, `test/headers.test.ts`, `test/parse.test.ts`. `pnpm load` and `pnpm check` name every header read through a declared alias |
+| Staging and daily marts | Built, with known gaps | `migrations/006_staging.sql`, `007_marts.sql`, `008_...`, `test/staging.test.ts`. `pnpm check` reports invalid rows and uncounted event types (`test/check.test.ts`). Gap: `invalid_rows` also counts lines a later batch superseded, and an order with a failed `gross` cast still counts in `orders` (it now alerts) |
+| Missing-source detection and the completeness gate | Built, with known gaps | `src/ingest/check.ts`, `src/ingest/coverage.ts`, `migrations/010_report_run_withheld.sql`, `test/check.test.ts`, `test/report.test.ts`. `pnpm report` withholds the days of a batch that never loaded. Gap: a number published before its window became incomplete stays visible until the batch loads, and the gate reads the manifest, so a tenant missing from it gets no withholding |
 | Late arrivals: published versions and restatements | Built, with known gaps | `src/report/publish.ts`, `migrations/009_published_reports.sql`, `test/report.test.ts`. Gap: a value-map edit restates history with an empty `caused_by` |
-| Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`. Gap: value-map targets are not validated, so a typo is silently not counted |
+| Third tenant by configuration only | Built, with known gaps | `src/config/tenants.ts`, "a third tenant added by configuration only" in `test/staging.test.ts`, `test/tenants.test.ts`. The config rejects an event-type target that is not canonical. Gap: a missing value-map entry passes the config and is caught only by `pnpm check` after loading |
 | Reconciliation with `finance_summary.csv` | Test only | daily gross matches to the cent in `test/loader.test.ts` and `test/staging.test.ts`; the file is not ingested |
 | FX conversion, scheduler, alerting, streaming large files | Not built | see [TRADEOFFS.md](TRADEOFFS.md) |
 
@@ -53,8 +53,8 @@ I went deep on two areas: loading that is safe to rerun, and tenant isolation en
 | `src/config/` | the canonical columns per source (`sources.ts`) and the config schema (`tenants.ts`) |
 | `src/ingest/loader.ts` | `pnpm load`: planning, sha256 ledger, replay classification, fault injection |
 | `src/ingest/headers.ts`, `parse.ts`, `reasons.ts` | header resolution and quarantine reasons |
-| `src/ingest/check.ts` | `pnpm check`: manifest vs ledger, exit codes |
-| `src/report/publish.ts` | `pnpm report`: versioned publication, restatements, `caused_by` |
+| `src/ingest/check.ts` | `pnpm check`: manifest vs ledger, data-quality findings, declared-alias notes, exit codes |
+| `src/report/publish.ts`, `src/ingest/coverage.ts` | `pnpm report`: versioned publication, restatements, `caused_by`, withholding incomplete days |
 | `src/db/` | pools for the two roles, `withTenant`, migration runner, tenant seeding |
 | `migrations/` | roles, schemas, RLS policies, ledger, staging and marts views, published reports |
 | `docker/initdb/001_owner.sql` | creates the non-superuser owner role; the only thing the superuser does |
@@ -79,7 +79,7 @@ pnpm db:up        # Postgres 17 on localhost:54329, waits until healthy
 pnpm migrate      # applies migrations/ and seeds ops.tenant + ops.value_map from tenants/*.json
 pnpm load         # loads every manifest batch for every tenant
 pnpm check        # manifest vs ledger; exits 2 on the supplied fixtures (see below)
-pnpm report       # publishes version 1 of every mart day; a rerun without new data publishes nothing
+pnpm report       # publishes version 1 of every complete mart day; a rerun without new data publishes nothing
 pnpm test         # needs the database up and migrated; uses its own throwaway tenants
 pnpm typecheck
 ```
@@ -96,11 +96,15 @@ Expected output of the first `pnpm load` on the supplied fixtures ends with:
 load: 39 loaded, 0 skipped, 0 quarantined, 1 missing, 0 failed, 0 blocked
 ```
 
-`pnpm report` prints one line per tenant: `published: <tenant> (run <id>; <n> versions, <n> restated, <n> unchanged)`, or `nothing to publish` in place of the run when nothing changed. For example, after batch 5 arrives late (see [Late arrivals](#late-arrivals-publish-load-late-data-publish-again)): `published: northwind (run 4; 67 versions, 18 restated, 207 unchanged)`. Restatements are information, not errors: it exits 0 unless a tenant failed. Each tenant publishes in its own transaction.
+The lines for `ad_spend` batches 4 and 5 of both tenants name the declared alias, for example `loaded: lumen/ad_spend/batch 4 (18 rows; header cost_usd read as spend)`. A skipped file's line does not.
+
+`pnpm report` prints one line per tenant: `published: <tenant> (run <id>; <n> versions, <n> restated, <n> unchanged, <n> withheld)`, or `nothing to publish` in place of the run when nothing changed. For example, after batch 5 arrives late (see [Late arrivals](#late-arrivals-publish-load-late-data-publish-again)): `published: northwind (run 4; 67 versions, 18 restated, 207 unchanged, 0 withheld)`. Restatements and withheld keys are information, not errors: it exits 0 unless a tenant failed. Each tenant publishes in its own transaction.
 
 The one `missing` file is `lumen/ad_spend/batch_03.csv`: the manifest lists it, the fixtures do not contain it. That is a finding about the data, not a failure of the run, so `pnpm load` still exits 0. The same holds for quarantined files: `pnpm load` exits 0 when it quarantines, and 1 only when a file failed to load.
 
-Because of that missing batch, `pnpm check` exits 2 overall on the supplied fixtures even though northwind is healthy: the exit code covers every tenant. Nothing stops `pnpm report`, though: it publishes lumen's channel performance for January 18 to 23 with spend 0 and ROAS `NULL`, as if no money was spent (see [Known gaps](TRADEOFFS.md#known-gaps)).
+Because of that missing batch, `pnpm check` exits 2 overall on the supplied fixtures even though northwind is healthy: the exit code covers every tenant.
+
+`pnpm report` withholds the days that batch covers instead of publishing them as if no money was spent. A key is withheld when its day falls inside the `covers_from`..`covers_to` window of a manifest batch with no loaded ledger row (not received, or only quarantined), for a source the mart is built from. On the supplied fixtures the first run prints northwind with `0 withheld` and lumen with `24 withheld`: `daily_channel_performance` for 2026-01-18 to 2026-01-23, 6 days times 4 channels. `daily_ad_spend` has no rows for those days, so it withholds no key, but the run still records the window. Revenue and email engagement do not depend on `ad_spend` and are published for those days. A withheld key gets no version, restatement or tombstone: whatever was published before stays the latest, and once the batch loads the key is published as usual. Each run records the windows and keys it held back in `ops.report_run.withheld`; a run that only withholds writes no run row. `pnpm report` reads `fixtures/manifest.json`, or `MANIFEST=<path>`; a tenant absent from the manifest gets no withholding. What the gate does not cover is in [Known gaps](TRADEOFFS.md#known-gaps).
 
 `pnpm seed` re-runs only the tenant seeding; `pnpm migrate` already does it. `pnpm db:down` stops the container and keeps the data.
 
@@ -130,7 +134,9 @@ pnpm load                             # 39 skipped, 1 missing: nothing is writte
 pnpm check; echo $?
 # lumen: 1 finding (19/20 batches loaded, as of 2026-02-04)
 #   not_received: ad_spend/batch 3 (lumen/ad_spend/batch_03.csv, covers through 2026-01-23)
+#   note: ad_spend batches 4-5 read header "cost_usd" as spend (declared alias)
 # northwind: healthy (20/20 batches loaded, as of 2026-02-04)
+#   note: ad_spend batches 4-5 read header "cost_usd" as spend (declared alias)
 # [ELIFECYCLE] Command failed with exit code 2.
 # 2
 
@@ -138,6 +144,13 @@ CHECK_AS_OF=2026-03-01 pnpm check; echo $?   # every configured source is also r
 ```
 
 Freshness alone would miss lumen's gap: `ad_spend` batches 4 and 5 loaded, so the source looks current through 2026-02-04. The check compares each listed batch with the ledger instead. `CHECK_AS_OF` is the date a scheduler expects data through; without it, the check uses the latest `covers_to` in the tenant's manifest. `MANIFEST=<path>` points the check at another manifest.
+
+The check also reads staging, and two data-quality findings exit 2 like the others:
+
+- `invalid_rows`: lines whose value is missing or fails its cast (`staging.invalid_rows`), per source and column, for example `invalid_rows: orders.gross 1 row (first: batch 1 line 3)`. Lines a later batch superseded count too.
+- `uncounted_values`: values of a column the marts count only in canonical form, today `email_events.type`, for example `uncounted_values: email_events.type "BOUNCE" 2 rows, not one of delivered, open, click, unsubscribe`. This is also how a missing value-map entry shows up.
+
+A `note:` line is not a finding and never changes the exit code. It names headers that loaded batches read through a declared alias, from the ledger; a quarantined batch gets no note. The supplied fixtures have neither data-quality finding.
 
 ### Quarantine: schema drift the config does not declare
 
@@ -149,12 +162,15 @@ pnpm db:reset && pnpm migrate
 pnpm load
 # quarantined: northwind/ad_spend/batch 4 (unknown_header: header "cost_usd" is neither a column of ad_spend nor a declared alias; missing_column: column "spend" is missing)
 # quarantined: northwind/ad_spend/batch 5 (...same reasons...)
-pnpm check        # quarantined: ad_spend/batch 4 (unknown_header, missing_column), ..., stale: ad_spend ...
+pnpm check        # quarantined: ad_spend/batch 4 (unknown_header, missing_column), ..., stale: ad_spend ...; no alias note for northwind
 git checkout -- tenants/northwind.json
 pnpm load         # batches 4 and 5 load now; everything else is skipped
+# loaded: northwind/ad_spend/batch 4 (18 rows; header cost_usd read as spend)
+# loaded: northwind/ad_spend/batch 5 (18 rows; header cost_usd read as spend)
+pnpm check        # northwind: healthy again, with its "batches 4-5" alias note
 ```
 
-The whole file is quarantined, never part of it, and the reasons are stored in `ops.batch_file.detail`. Quarantined attempts do not block a retry: the replay guard covers only loaded bytes.
+The whole file is quarantined, never part of it, and the reasons are stored in `ops.batch_file.detail`. Quarantined attempts do not block a retry: the replay guard covers only loaded bytes. While batches 4 and 5 are quarantined, `pnpm report` withholds northwind's channel performance for the days they cover, 2026-01-24 to 2026-02-04 (48 keys); `daily_ad_spend` has no rows for those days, so it withholds no key but records the windows.
 
 ### Quarantine: new bytes for a batch that is already loaded
 
@@ -173,22 +189,25 @@ The same bytes under a different batch number are quarantined as `duplicate_cont
 
 ### Late arrivals: publish, load late data, publish again
 
-Hold every batch 5 back, publish, then let it arrive:
+Hold every batch 5 back, publish, then let it arrive. The first report is given a manifest without batch 5, meaning batch 5 was not yet due. With the full manifest it would withhold the batch 5 days instead, and the second report would publish them as version 1 rather than restate them.
 
 ```sh
 pnpm db:reset && pnpm migrate
 for f in fixtures/*/*/batch_05.*; do mv "$f" "$f.late"; done
-pnpm load      # batches 1-4; every batch 5 is reported missing and leaves no ledger row
-pnpm report    # version 1 of every (mart, day, dimension) key
+node -e 'const m = require("./fixtures/manifest.json"); m.batches = m.batches.filter((b) => b.batch <= 4); require("fs").writeFileSync("/tmp/manifest-1-4.json", JSON.stringify(m))'
+pnpm load                                   # batches 1-4; every batch 5 is reported missing and leaves no ledger row
+MANIFEST=/tmp/manifest-1-4.json pnpm report  # version 1 of every complete (mart, day, dimension) key; lumen: 24 withheld
 for f in fixtures/*/*/batch_05.*.late; do mv "$f" "${f%.late}"; done
-pnpm load      # batch 5 of every source; batches 1-4 are skipped
-pnpm report    # northwind: 18 restated; lumen: 7 restated
-pnpm report    # nothing to publish for either tenant
+pnpm load                                   # batch 5 of every source; batches 1-4 are skipped
+pnpm report    # northwind: 18 restated, 0 withheld; lumen: 7 restated, 24 withheld
+pnpm report    # nothing to publish for either tenant; lumen still reports 24 withheld
 ```
+
+Lumen's `ad_spend` batch 3 is missing in both runs, so its channel performance for 2026-01-18 to 2026-01-23 is withheld both times and never enters the version or unchanged counts. The first report prints `published: lumen (run 1; 178 versions, 0 restated, 0 unchanged, 24 withheld)`, the second `published: lumen (run 3; 59 versions, 7 restated, 171 unchanged, 24 withheld)` and `published: northwind (run 4; 67 versions, 18 restated, 207 unchanged, 0 withheld)`.
 
 Northwind's email engagement is restated for exactly 2026-01-12 to 2026-01-17, caused by `northwind/email_events/batch_05.ndjson`. Revenue is restated too, and not only at the edge of the window: lumen's refunds batch 5 carries refunds dated January 9 and 28, weeks before its window, so those days' refunds and net go up after the client was told them. A day batch 5 did not touch keeps its single version. The day-by-day breakdown for both tenants is in [TRADEOFFS.md](TRADEOFFS.md#late-arrivals).
 
-`test/report.test.ts` runs the same sequence on clones of the fixtures. It asserts that exactly the keys batch 5 changed are restated, with `before` and `after` equal to the live numbers, and that northwind's email restatements are exactly those six days, caused by email batch 5. The counts 18 and 7 come from that run.
+`test/report.test.ts` runs the same sequence on clones of the fixtures, with each report given the manifest of what had been delivered by then. It asserts that exactly the keys batch 5 changed are restated, with `before` and `after` equal to the live numbers, that northwind's email restatements are exactly those six days, caused by email batch 5, and that lumen's withheld keys are never published. The counts 18 and 7 come from that run.
 
 Each restatement says what the client was told (`before`), what the number is now (`after`) and which batch files caused it (`caused_by`, `ops.batch_file` ids). Run this in `psql` as the application role (`docker compose exec postgres psql -U pipeline_app -d pipeline`, see [Query the data](#query-the-data)):
 
@@ -219,5 +238,5 @@ SELECT status, count(*) FROM ops.batch_file GROUP BY status;
 COMMIT;
 ```
 
-Useful views: `marts.daily_revenue`, `marts.daily_ad_spend`, `marts.daily_email_engagement`, `marts.daily_channel_performance`, `staging.invalid_rows`. Published reports: `marts.reported_metric` (the latest published version of each key, meaning what the client was told), `ops.published_metric` (every version) and `ops.restatement`.
+Useful views: `marts.daily_revenue`, `marts.daily_ad_spend`, `marts.daily_email_engagement`, `marts.daily_channel_performance`, `staging.invalid_rows`. Published reports: `marts.reported_metric` (the latest published version of each key, meaning what the client was told), `ops.published_metric` (every version), `ops.restatement`, and `ops.report_run.withheld` (what each run held back).
 

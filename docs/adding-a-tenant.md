@@ -12,8 +12,8 @@ A new client is one JSON file, its batch files and its manifest entries. No Type
    ```sh
    pnpm migrate   # validates every tenants/*.json and seeds ops.tenant and ops.value_map
    pnpm load      # loads the new tenant's batches; other tenants' files are skipped
-   pnpm check     # the new tenant should report "healthy"
-   pnpm report    # publishes version 1 of every day for the new tenant
+   pnpm check     # the new tenant should report "healthy", possibly with alias notes
+   pnpm report    # publishes version 1 of every complete day for the new tenant
    ```
 
 5. Verify with a scoped query ([Verify](#verify)).
@@ -86,8 +86,9 @@ Every source has a fixed set of columns (`src/config/sources.ts`). Each file mus
 
 - Seeding copies them into `ops.value_map`, which is tenant data under RLS. Staging looks values up there.
 - Matching is exact: `"Meta"` does not match `"meta"`.
-- A value without an entry passes through unchanged. Nothing flags it (see [TRADEOFFS.md](../TRADEOFFS.md#known-gaps)).
-- Targets are not validated yet. A typo such as `"Opened": "opened"` is accepted, and those events are then silently not counted. Use exactly the canonical values below, and after the first load run `pnpm check` and `SELECT * FROM staging.invalid_rows` (see [Verify](#verify)).
+- A value without an entry passes through unchanged. For `email_events.type`, `pnpm check` reports it as `uncounted_values` after loading; config validation cannot know which raw values a file will carry (see [TRADEOFFS.md](../TRADEOFFS.md#known-gaps)).
+- Targets for `email_events.type` must be canonical, or the config is rejected. A typo such as `"Opened": "opened"` fails with `value map target "opened" for email_events.type is not one of delivered, open, click, unsubscribe`.
+- `orders.channel` and `ad_spend.platform` are open on purpose, so a new channel is configuration only. Their targets are not validated: a typo there becomes a channel of its own, and nothing flags it.
 - Map onto the canonical values the marts use:
 
   | Column | Canonical values |
@@ -111,6 +112,8 @@ Invalid tenant config acme.json:
   → at sources.orders.columnAliases
 ✖ alias "platform" for "spend" is itself a column of ad_spend, so that header would be ambiguous
   → at sources.ad_spend.columnAliases.spend
+✖ value map target "opened" for email_events.type is not one of delivered, open, click, unsubscribe
+  → at sources.email_events.valueMaps.type.Opened
 ```
 
 ```text
@@ -152,15 +155,19 @@ Add one entry per file to `fixtures/manifest.json`, under `batches`:
 | `source` | one of the four sources |
 | `batch` | positive integer, unique per tenant and source; batches load in this order, and a later batch wins on overlapping rows |
 | `path` | relative to `fixtures/`, and inside the tenant's `fixturesDir`, or the whole load is rejected before anything is written |
-| `covers_from`, `covers_to` | `YYYY-MM-DD`; `pnpm check` uses `covers_to` for freshness |
+| `covers_from`, `covers_to` | `YYYY-MM-DD`; `pnpm check` uses `covers_to` for freshness, and `pnpm report` withholds days in this window while the batch has not loaded |
 
-A listed file that is absent is reported as `missing` by `pnpm load` and `not_received` by `pnpm check`. That is how you declare a batch you expect but have not received.
+A listed file that is absent is reported as `missing` by `pnpm load` and `not_received` by `pnpm check`. That is how you declare a batch you expect but have not received. Until it loads, `pnpm report` withholds the days it covers in every mart built from that source. A tenant with no manifest entries gets no withholding.
 
 ## Verify
 
-`pnpm check` should print `acme: healthy (N/N batches loaded, as of <latest covers_to>)` if every listed batch loaded. Exit code 2 means findings; the lines below the summary say which batch and why. The exit code covers every tenant, so with the supplied fixtures it is 2 even when `acme` is healthy: lumen's `ad_spend` batch 3 never arrived. Read the line for your tenant.
+`pnpm check` should print `acme: healthy (N/N batches loaded, as of <latest covers_to>)` if every listed batch loaded and staging is clean. Exit code 2 means findings; the lines below the summary say which batch and why. The exit code covers every tenant, so with the supplied fixtures it is 2 even when `acme` is healthy: lumen's `ad_spend` batch 3 never arrived. Read the lines for your tenant.
 
-`staging.invalid_rows` in the query below is not reported by any command yet, so check it by hand after the first load: a non-empty result means values that failed their cast and are left out of the marts' sums (an order with a bad `gross` is still counted in `orders`).
+If something is off, these are the lines you will see (a tenant with clean data shows none of the findings):
+
+- `invalid_rows: orders.gross 1 row (first: batch 1 line 3)`: values that are missing or failed their cast, from `staging.invalid_rows`. They are left out of the marts' sums, and an order with a bad `gross` is still counted in `orders`. Lines a later batch superseded are counted too, so a corrected row keeps the finding until the database is reset.
+- `uncounted_values: email_events.type "BOUNCE" 2 rows, not one of delivered, open, click, unsubscribe`: an event type the marts never count, usually a missing value-map entry. Add the entry and run `pnpm migrate`; the views follow the map right away.
+- `note: ad_spend batch 1 read header "cost" as spend (declared alias)`: a loaded batch read a header through one of your aliases. Notes are not findings and never change the exit code. `pnpm load` says the same on the file's line: `loaded: acme/ad_spend/batch 1 (<n> rows; header cost read as spend)`.
 
 Then query the marts as the application role. Every tenant table and view returns zero rows until the transaction sets `app.tenant_id`:
 
