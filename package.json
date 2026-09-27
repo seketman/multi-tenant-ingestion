@@ -13,10 +13,12 @@
     "db:reset": "docker compose down -v && docker compose up -d --wait",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
+    "load": "tsx src/ingest/loader.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "csv-parse": "^7.0.3",
     "pg": "^8.23.0",
     "zod": "^4.6.5"
   },
