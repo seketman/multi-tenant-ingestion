@@ -43,7 +43,13 @@ export type ManifestEntry = Manifest["batches"][number];
 
 /** Reads and validates a manifest file. */
 export async function loadManifest(path: string): Promise<Manifest> {
-  const raw: unknown = JSON.parse(await readFile(path, "utf8"));
+  const text = await readFile(path, "utf8");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid manifest ${path}: ${(error as Error).message}`, { cause: error });
+  }
   const parsed = manifestSchema.safeParse(raw);
   if (!parsed.success) {
     throw new Error(`Invalid manifest ${path}:\n${z.prettifyError(parsed.error)}`);

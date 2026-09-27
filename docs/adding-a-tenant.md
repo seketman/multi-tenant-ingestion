@@ -158,13 +158,13 @@ Invalid tenant config acme.json:
 Tenant config other.json declares id "acme"; the file name must match the id
 ```
 
-A file that is not valid JSON (here, a trailing comma) fails before the schema runs, and the message does **not** name the file:
+A file that is not valid JSON (here, a trailing comma) fails before the schema runs, with the parser's message after the file name:
 
 ```text
-Expected double-quoted property name in JSON at position 43 (line 4 column 1)
+Invalid tenant config acme.json: Expected double-quoted property name in JSON at position 43 (line 4 column 1)
 ```
 
-The same happens for a JSON syntax error in `fixtures/manifest.json`. `pnpm tenant:validate` names the file, and lists every invalid tenant file in one run. See [A JSON syntax error with no file name](#a-json-syntax-error-with-no-file-name).
+A JSON syntax error in `fixtures/manifest.json` reads `Invalid manifest /full/path/to/fixtures/manifest.json: ...`. See [A JSON syntax error](#a-json-syntax-error).
 
 ## Fixtures and manifest
 
@@ -253,7 +253,7 @@ const rows = await withTenant("acme", async (client) =>
 | A channel or platform you did not expect, and `pnpm check` reports no finding for it | a typo in a value-map target, or a raw spelling you did not map. `pnpm tenant:validate` would have warned about it before loading | see [A channel or platform value is wrong](#a-channel-or-platform-value-is-wrong) |
 | `uncounted_values: email_events.type ...` | a raw event type has no value-map entry | add the entry, then `pnpm migrate` (or `pnpm seed`); the views follow right away |
 | Wrong numbers from a file that loaded with the wrong alias | an alias change never reinterprets a loaded file; running `pnpm load` again prints `skipped:` | see [Undo a load](#undo-a-load) |
-| An error with no file name, such as `Expected double-quoted property name in JSON ...` | a JSON syntax error in a tenant file or the manifest | run `pnpm tenant:validate`, which names the file; see [A JSON syntax error with no file name](#a-json-syntax-error-with-no-file-name) |
+| `Invalid tenant config acme.json: Expected double-quoted property name in JSON ...` | a JSON syntax error in the named tenant file (`Invalid manifest ...` for the manifest) | fix the file at the given line and column; see [A JSON syntax error](#a-json-syntax-error) |
 
 ### A channel or platform value is wrong
 
@@ -300,17 +300,9 @@ A loaded file keeps the header map it was loaded with, and loading it again prin
 
   The order follows the foreign keys: each table is deleted before the one it references. Then fix the alias and run `pnpm load` again.
 
-### A JSON syntax error with no file name
+### A JSON syntax error
 
-`pnpm migrate`, `load`, `check` and `report` use `JSON.parse`, which does not know which file it read, so the message has a position but no name. `pnpm tenant:validate` reads each file itself and names it, for example `error invalid_json: tenants/acme.json: Expected double-quoted property name ...`. Without it, check each file on its own:
-
-```sh
-for f in tenants/*.json fixtures/manifest.json; do
-  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$f" 2>/dev/null || echo "invalid JSON: $f"
-done
-```
-
-Any JSON linter works too. The position in the original message (`line 4 column 1`) then points into that file.
+`pnpm migrate`, `load`, `check` and `report` name the file and give the position in it, for example `Invalid tenant config acme.json: Expected double-quoted property name in JSON at position 43 (line 4 column 1)`, or `Invalid manifest /full/path/to/fixtures/manifest.json: ...` for the manifest. They stop at the first invalid file. `pnpm tenant:validate` lists every invalid file in one run, for example `error invalid_json: tenants/acme.json: Expected double-quoted property name ...`, so run it when more than one file may be broken.
 
 ## What never needs to change
 

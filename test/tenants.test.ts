@@ -120,4 +120,14 @@ describe("tenant config", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("names the file on a JSON syntax error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tenants-"));
+    try {
+      await writeFile(join(dir, "acme.json"), '{ "id": "acme", }');
+      await expect(loadTenants(dir)).rejects.toThrow(/Invalid tenant config acme\.json: .*JSON/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadManifest, type ManifestEntry, manifestSchema } from "../src/ingest/manifest.ts";
 
@@ -40,5 +43,16 @@ describe("manifestSchema", () => {
   it("loads the supplied fixtures manifest", async () => {
     const manifest = await loadManifest("fixtures/manifest.json");
     expect(manifest.batches.length).toBeGreaterThan(0);
+  });
+
+  it("names the file on a JSON syntax error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "manifest-"));
+    const path = join(dir, "manifest.json");
+    try {
+      await writeFile(path, '{ "batches": [], }');
+      await expect(loadManifest(path)).rejects.toThrow(`Invalid manifest ${path}: `);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

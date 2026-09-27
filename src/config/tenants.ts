@@ -116,7 +116,13 @@ export async function loadTenants(dir: string = process.env.TENANTS_DIR ?? DEFAU
   const files = (await readdir(dir)).filter((f) => f.endsWith(".json")).sort();
   const tenants: TenantConfig[] = [];
   for (const file of files) {
-    const raw: unknown = JSON.parse(await readFile(join(dir, file), "utf8"));
+    const text = await readFile(join(dir, file), "utf8");
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (error) {
+      throw new Error(`Invalid tenant config ${file}: ${(error as Error).message}`, { cause: error });
+    }
     const parsed = tenantConfigSchema.safeParse(raw);
     if (!parsed.success) {
       throw new Error(`Invalid tenant config ${file}:\n${z.prettifyError(parsed.error)}`);
